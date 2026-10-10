@@ -1,0 +1,12 @@
+schema_version: 1
+map_id: laboratory_map_v1
+missions:
+  roundtrip:
+    name: 测试点A往返
+    steps:
+      - waypoint: point_a
+        timeout_sec: 60.0
+        dwell_sec: 2.0
+      - waypoint: home
+        timeout_sec: 60.0
+        dwell_sec: 2.0

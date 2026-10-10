@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/livox_sdk2Targets.cmake")
+
+# ament_cmake_auto consumes this variable when linking manifest dependencies.
+set(livox_sdk2_TARGETS livox_sdk2::livox_lidar_sdk_shared)
+check_required_components(livox_sdk2)

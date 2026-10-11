@@ -1,6 +1,6 @@
 # G1 SLAM 本机运行
 
-本项目已适配当前电脑：Ubuntu 22.04、x86_64、ROS 2 Humble。包含 MID360 驱动、FAST-LIO 建图、NDT 重定位、Nav2、G1 速度桥及导航点/巡航工具。
+本项目已适配当前电脑：Ubuntu 22.04、x86_64、ROS 2 Humble。包含 MID360 驱动、FAST-LIO 建图、自动全局定位和 NDT 跟踪、Nav2、G1 速度桥及导航点/巡航工具。
 
 在项目根目录执行下面的命令。
 
@@ -62,13 +62,31 @@ python3 g1_slam_ws/maps/pcd2pgm_multilayer.py --help
 
 ## 定位与导航
 
-先结束建图，然后启动定位和 Nav2：
+先结束建图，然后在项目根目录启动自动定位和 Nav2：
 
 ```bash
-./g1_slam_ws/script/g1_navigation.sh start
+./g1_slam_ws/script/g1_navigation.sh start-auto
 ```
 
-在 RViz 点击 **2D Pose Estimate**，指定实际位置和朝向。NDT 定位成功后脚本继续启动 Nav2。若初始化等待超时，完成定位后运行 `g1_navigation.sh continue`。
+该入口不需要初始位置、朝向或 `auto_start_pose.env`。机器人保持静止后，系统采集点云，在三维地图中搜索候选位置和朝向，用 NDT 精配准及后续新扫描确认结果。只有 `/g1_relocalization/status` 报告有效且新鲜的 `LOCALIZED` 或 `TRACKING` 状态，脚本才启动 Nav2。默认等待 180 秒，可通过环境变量调整：
+
+```bash
+G1_LOCALIZATION_TIMEOUT_SEC=240 ./g1_slam_ws/script/g1_navigation.sh start-auto
+```
+
+搜索失败、匹配存在歧义或等待超时，脚本返回非零，保留雷达、FAST-LIO、重定位和地图节点，方便检查及人工后备。可在 RViz 点击 **2D Pose Estimate** 指定实际位置和朝向；定位状态有效后运行 `./g1_slam_ws/script/g1_navigation.sh continue`。重复走廊或相似房间可能需要人工后备。
+
+保留以下入口：
+
+| 命令 | 定位方式与用途 |
+| --- | --- |
+| `./g1_slam_ws/script/g1_navigation.sh start-auto` | 自动全局定位后启动 Nav2 规划 |
+| `./g1_slam_ws/script/g1_navigation.sh start-auto-dry` | 自动全局定位后启动 Nav2 和 Dry Run 安全桥 |
+| `./g1_slam_ws/script/g1_navigation.sh start` / `start-dry` | 人工 **2D Pose Estimate** 初始化 |
+| `./g1_slam_ws/script/g1_navigation.sh start-fixed` / `start-fixed-dry` | 使用 `g1_slam_ws/script/auto_start_pose.env` 中的固定坐标 |
+| `./g1_slam_ws/script/g1_navigation.sh continue` / `continue-dry` | 检查当前实时定位后继续启动 Nav2 |
+
+`start-fixed` 是原 `start-auto` 固定坐标模式的新名称。使用它时需自行创建 `auto_start_pose.env`，填写 `AUTO_X`、`AUTO_Y`、`AUTO_YAW`（弧度），可选 `AUTO_Z`（默认 0）。
 
 连接真机速度桥：
 
@@ -77,7 +95,9 @@ python3 g1_slam_ws/maps/pcd2pgm_multilayer.py --help
 ./g1_slam_ws/script/g1_navigation_real.sh enable
 ```
 
-`start` 启动桥时安全门保持关闭；`enable` 才允许 `/cmd_vel_nav` 控制 G1。机器人运动模式由操作者用原有方式切换。关闭控制或结束导航：
+真机桥的 `start`、`enable` 都要求 Nav2 已激活且当前定位有效、新鲜；同名 Dry Run 桥会被拒绝。`start` 启动桥时安全门保持关闭；`enable` 才允许 `/cmd_vel_nav` 控制 G1。机器人运动模式由操作者用原有方式切换。关闭控制或结束导航：
+
+定位失效或状态断流时，导航速度桥会停止输出并关闭控制门。重新确认定位后，需要显式 `enable` 和新的速度指令才能恢复控制。
 
 ```bash
 ./g1_slam_ws/script/g1_navigation_real.sh disable
@@ -85,7 +105,30 @@ python3 g1_slam_ws/maps/pcd2pgm_multilayer.py --help
 ./g1_slam_ws/script/g1_navigation.sh stop
 ```
 
-只验证规划与速度桥时，用 `g1_navigation.sh start-dry`；该入口仍需要真实雷达定位。无显示器时设置 `G1_ENABLE_RVIZ=0`，并从其他终端发布初始位姿，或配置 `script/auto_start_pose.env` 后使用 `start-auto`。
+只验证规划与速度桥时，用 `./g1_slam_ws/script/g1_navigation.sh start-auto-dry`；该入口仍需要真实雷达定位。无显示器时设置 `G1_ENABLE_RVIZ=0`，自动全局定位可以直接运行。`start-auto` 启动定位和 Nav2 规划，真机控制仍通过上述速度桥入口启用。
+
+```bash
+# 当前定位状态（String 消息中的 JSON）：state、valid、reason、fitness 及时间戳
+ros2 topic echo /g1_relocalization/status --qos-durability transient_local
+# 使用同一实时就绪检查；非零表示当前不能启动导航
+python3 g1_slam_ws/script/g1_wait_localization.py --once --timeout 5
+# 无雷达、无机器人运行入口回归检查
+python3 -m unittest discover -s g1_slam_ws/script/tests -v
+```
+
+自动定位参数位于 `g1_slam_ws/src/g1_relocalization/config/relocalization.yaml`。更换地图或雷达安装后，需要用不同位置、朝向及相似场景的实测点云验证定位成功率；离线检查不能代替真实场景验收。
+
+第一版适用于相同楼层、既有雷达安装和已标定的地面模型。搜索采用全图粗搜索及多个候选的局部细化，是启发式算法；重复结构、遮挡和地图变化仍可能需要人工后备。运行中被搬移后自动重新全局搜索尚未实现。
+
+离线检查当前地图索引，或对独立录制的局部扫描测试匹配：
+
+```bash
+source unitree_ros2/setup.sh
+ros2 run g1_relocalization global_matcher_check --map "$PWD/g1_slam_ws/maps/map.pcd"
+ros2 run g1_relocalization global_matcher_check --help
+```
+
+只传地图时不会验证定位效果。扫描坐标和地面参数要求见工具帮助；完整模块验证和新增功能现场验收步骤位于本机 `doc/`，该目录已被 Git 忽略。
 
 ## 诊断和其他工具
 

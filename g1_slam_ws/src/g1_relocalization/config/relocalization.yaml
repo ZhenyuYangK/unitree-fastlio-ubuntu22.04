@@ -43,7 +43,7 @@ g1_relocalization:
     # start-auto 使用 G1_LOCALIZATION_TIMEOUT_SEC（默认 180 秒）覆盖搜索预算。
     global_search_timeout_sec: 60.0
     global_use_search_bounds: false
-    # 可选限制搜索区域；坐标采用原始 map 系。
+    # 可选限制搜索区域；默认采用 map 系，开启校平时采用校平坐标系。
     global_min_x: -8.5
     global_max_x: 28.05
     global_min_y: -26.5

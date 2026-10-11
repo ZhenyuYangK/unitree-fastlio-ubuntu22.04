@@ -22,12 +22,15 @@ class LocalizationHealthTest(unittest.TestCase):
 
     def test_invalid_and_unreachable_are_not_healthy(self):
         for field, value in (('valid', 1), ('stamp_ns', True),
-                             ('state', []), ('last_success_stamp_ns', self.now + 1)):
+                             ('state', []), ('last_success_stamp_ns', self.now + 1),
+                             ('stamp_ns', 10 ** 1000),
+                             ('last_success_stamp_ns', 1 << 63)):
             status = dict(self.status)
             status[field] = value
             self.assertTrue(localization_status_reason(status, .1, self.now))
         self.assertTrue(localization_status_reason(self.status, 1.01, self.now))
         self.assertTrue(localization_status_reason(None, None, self.now))
+        self.assertTrue(localization_status_reason(self.status, .1, 10 ** 1000))
 
     def test_bad_json_never_reuses_prior_valid_status(self):
         for value in ('garbage', '[]', 'null', '{'):

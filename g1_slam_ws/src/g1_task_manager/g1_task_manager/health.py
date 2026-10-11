@@ -2,6 +2,8 @@
 import json
 import math
 
+MAX_STAMP_NS = (1 << 63) - 1
+
 
 def validate_limits(max_tf_age_sec, max_fitness, max_fitness_age_sec):
     for name, value in (('max_tf_age_sec', max_tf_age_sec),
@@ -38,12 +40,14 @@ def localization_status_reason(status, received_age_sec, now_ns,
     if (received_age_sec is None or not math.isfinite(received_age_sec)
             or received_age_sec < 0 or received_age_sec > 1.0):
         return '定位状态接收已过期'
-    if type(now_ns) is not int or now_ns <= 0:
+    if type(now_ns) is not int or not 0 < now_ns <= MAX_STAMP_NS:
         return '当前ROS时间无效'
     for field, limit in (('stamp_ns', 1.0),
                          ('last_success_stamp_ns', min(3.0, max_success_age_sec))):
         stamp = status.get(field)
-        if type(stamp) is not int or stamp <= 0:
+        # The publisher and ROS clock use int64 nanoseconds. Check the range
+        # before division so malformed huge JSON integers fail closed as well.
+        if type(stamp) is not int or not 0 < stamp <= MAX_STAMP_NS:
             return '定位状态{}无效'.format(field)
         age = (now_ns - stamp) / 1e9
         if age < 0 or age > limit:

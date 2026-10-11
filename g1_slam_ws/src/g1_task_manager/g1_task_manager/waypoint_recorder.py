@@ -4,7 +4,8 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, String
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from tf2_ros import Buffer
 from tf2_ros import TransformListener
 
@@ -56,6 +57,12 @@ class WaypointRecorderNode(Node):
 
         self.latest_fitness = None
         self.latest_fitness_time = None
+        self.localization_status = None
+        self.localization_status_time = None
+        self.status_subscription = self.create_subscription(
+            String, '/g1_relocalization/status', self._status_callback,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         self.fitness_subscription = (
             self.create_subscription(
@@ -70,11 +77,24 @@ class WaypointRecorderNode(Node):
         self.latest_fitness = float(message.data)
         self.latest_fitness_time = time.monotonic()
 
+    def _status_callback(self, message):
+        from .health import parse_localization_status
+        self.localization_status = parse_localization_status(message.data)
+        self.localization_status_time = time.monotonic()
+
     def _check_fitness(
         self,
         max_fitness,
         max_fitness_age_sec,
     ):
+        from .health import localization_status_reason
+        status_age = (None if self.localization_status_time is None else
+                      time.monotonic() - self.localization_status_time)
+        reason = localization_status_reason(self.localization_status, status_age,
+                                           self.get_clock().now().nanoseconds,
+                                           max_fitness_age_sec)
+        if reason:
+            raise WaypointRecordError(reason)
         if (
             self.latest_fitness is None
             or self.latest_fitness_time is None

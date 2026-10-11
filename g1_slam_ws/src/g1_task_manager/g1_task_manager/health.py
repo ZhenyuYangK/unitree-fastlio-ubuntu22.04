@@ -1,4 +1,5 @@
 """Pure validation shared by preflight and in-motion monitoring."""
+import json
 import math
 
 
@@ -27,3 +28,36 @@ def health_reason(fitness, fitness_age, tf_stamp_ns, now_ns,
     if age > max_tf_age_sec:
         return 'TF已过期：{:.3f}s'.format(age)
     return ''
+
+
+def localization_status_reason(status, received_age_sec, now_ns,
+                               max_success_age_sec=3.0):
+    """A current TF/fitness cannot replace a confirmed, fresh successful scan."""
+    if not isinstance(status, dict):
+        return '尚未收到有效/g1_relocalization/status'
+    if (received_age_sec is None or not math.isfinite(received_age_sec)
+            or received_age_sec < 0 or received_age_sec > 1.0):
+        return '定位状态接收已过期'
+    if type(now_ns) is not int or now_ns <= 0:
+        return '当前ROS时间无效'
+    for field, limit in (('stamp_ns', 1.0),
+                         ('last_success_stamp_ns', min(3.0, max_success_age_sec))):
+        stamp = status.get(field)
+        if type(stamp) is not int or stamp <= 0:
+            return '定位状态{}无效'.format(field)
+        age = (now_ns - stamp) / 1e9
+        if age < 0 or age > limit:
+            return '定位状态{}过期/未来：{:.3f}s'.format(field, age)
+    if status['last_success_stamp_ns'] > status['stamp_ns']:
+        return '成功扫描时间晚于定位状态发布时间'
+    if status.get('valid') is not True or status.get('state') not in ('LOCALIZED', 'TRACKING'):
+        return '定位未确认：{} {}'.format(status.get('state'), status.get('reason', ''))
+    return ''
+
+
+def parse_localization_status(data):
+    try:
+        status = json.loads(data)
+    except (TypeError, ValueError):
+        return None
+    return status if isinstance(status, dict) else None

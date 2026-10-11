@@ -15,6 +15,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(unitree_api REQUIRED)
 
@@ -58,19 +59,20 @@ ament_target_dependencies(
 )
 
 #
-# Existing safety-layer dry-run node.
-#
-# It is intentionally not connected to the new backend library yet.
+# Safety layer with selectable backend and optional localization guard.
 #
 add_executable(
   g1_cmd_vel_dry_run
   src/g1_cmd_vel_dry_run.cpp
 )
 
+target_include_directories(g1_cmd_vel_dry_run PRIVATE ${UNITREE_ROS2_EXAMPLE_INCLUDE})
+
 ament_target_dependencies(
   g1_cmd_vel_dry_run
   rclcpp
   geometry_msgs
+  std_msgs
   std_srvs
 )
 
@@ -97,5 +99,16 @@ install(
   DIRECTORY config
   DESTINATION share/${PROJECT_NAME}
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_test REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_test(localization_guard
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_localization_guard.py
+      --bridge $<TARGET_FILE:g1_cmd_vel_dry_run>
+    TIMEOUT 90
+  )
+endif()
 
 ament_package()

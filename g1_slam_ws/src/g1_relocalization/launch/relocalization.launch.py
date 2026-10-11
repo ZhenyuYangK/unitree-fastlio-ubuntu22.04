@@ -29,6 +29,10 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value=config_file),
         DeclareLaunchArgument(
+            "initialization_mode", default_value="manual",
+            description="manual waits for initialpose; global searches without a position prior",
+        ),
+        DeclareLaunchArgument(
             "map_path", default_value=default_map_path(package_path),
             description="PCD map path",
         ),
@@ -39,6 +43,7 @@ def generate_launch_description():
             output="screen",
             parameters=[LaunchConfiguration("params_file"), {
                 "map_path": LaunchConfiguration("map_path"),
+                "initialization_mode": LaunchConfiguration("initialization_mode"),
             }],
         )
     ])

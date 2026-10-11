@@ -1,661 +1,598 @@
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
-#include <Eigen/Core>
 #include <Eigen/Geometry>
-
 #include <rclcpp/rclcpp.hpp>
-#include <rclcpp/executors/multi_threaded_executor.hpp>
-
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
-#include <geometry_msgs/msg/transform.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float64.hpp>
-
+#include <std_msgs/msg/string.hpp>
 #include <tf2_ros/transform_broadcaster.h>
-
+#include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
 #include <pcl/registration/ndt.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <g1_relocalization/global_matcher.hpp>
+#include <g1_relocalization/pose_buffer.hpp>
+
+namespace
+{
+constexpr double kPi = 3.14159265358979323846;
+using Cloud = g1_relocalization::GlobalCloud;
+using Clock = std::chrono::steady_clock;
+int64_t stampNs(const builtin_interfaces::msg::Time & stamp)
+{
+  return static_cast<int64_t>(stamp.sec) * 1000000000 + stamp.nanosec;
+}
+std::string quoted(const std::string & text)
+{
+  std::ostringstream out;
+  out << '"';
+  for (const unsigned char c : text) {
+    if (c == '"' || c == '\\') {out << '\\' << c;}
+    else if (c < 0x20) {out << "\\u" << std::hex << std::setw(4) << std::setfill('0') << int(c);}
+    else {out << c;}
+  }
+  out << '"';
+  return out.str();
+}
+Eigen::Matrix4f translation(const Eigen::Vector3f & offset)
+{
+  auto result = Eigen::Matrix4f::Identity().eval();
+  result.block<3, 1>(0, 3) = offset;
+  return result;
+}
+double rotationDistance(const Eigen::Matrix4f & a, const Eigen::Matrix4f & b)
+{
+  return Eigen::Quaternionf(a.block<3, 3>(0, 0)).angularDistance(
+    Eigen::Quaternionf(b.block<3, 3>(0, 0)));
+}
+bool poseMatrix(const geometry_msgs::msg::Pose & pose, Eigen::Matrix4f & result)
+{
+  Eigen::Quaternionf q(pose.orientation.w, pose.orientation.x,
+    pose.orientation.y, pose.orientation.z);
+  Eigen::Vector3f t(pose.position.x, pose.position.y, pose.position.z);
+  if (!q.coeffs().allFinite() || !std::isfinite(q.norm()) || q.norm() < 1e-6 ||
+    !t.allFinite()) {return false;}
+  result = Eigen::Matrix4f::Identity();
+  result.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
+  result.block<3, 1>(0, 3) = t;
+  return true;
+}
+geometry_msgs::msg::Pose matrixPose(const Eigen::Matrix4f & matrix)
+{
+  geometry_msgs::msg::Pose pose;
+  pose.position.x = matrix(0, 3);
+  pose.position.y = matrix(1, 3);
+  pose.position.z = matrix(2, 3);
+  Eigen::Quaternionf q(matrix.block<3, 3>(0, 0));
+  q.normalize();
+  pose.orientation.x = q.x(); pose.orientation.y = q.y();
+  pose.orientation.z = q.z(); pose.orientation.w = q.w();
+  return pose;
+}
+}  // namespace
 
 class G1RelocalizationNode : public rclcpp::Node
 {
 public:
-  using PointT = pcl::PointXYZI;
-  using PointCloudT = pcl::PointCloud<PointT>;
-
-  G1RelocalizationNode()
-  : Node("g1_relocalization")
+  G1RelocalizationNode() : Node("g1_relocalization")
   {
-    declareParameters();
     readParameters();
-    initializeBodyBaseTransform();
+    base_T_body_.block<3, 3>(0, 0) = Eigen::AngleAxisf(
+      body_roll_deg_ * kPi / 180., Eigen::Vector3f::UnitX()).toRotationMatrix();
+    map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/global_pcd_map",
+      rclcpp::QoS(1).reliable().transient_local());
+    pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>("/localization_pose", 10);
+    fitness_pub_ = create_publisher<std_msgs::msg::Float64>("/localization_fitness", 10);
+    status_pub_ = create_publisher<std_msgs::msg::String>("/g1_relocalization/status",
+      rclcpp::QoS(1).reliable().transient_local());
+    tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    loadMap();
+    matcher_ = std::make_unique<g1_relocalization::GlobalMatcher>(map_, options_);
 
-    map_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/global_pcd_map",
-      rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local());
+    // Sensor callbacks remain responsive while the worker runs global search/NDT.
+    input_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions subscription_options;
+    subscription_options.callback_group = input_group_;
+    const auto qos = rclcpp::SensorDataQoS().keep_last(2);
+    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(cloud_topic_, qos,
+      [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {cloudCallback(msg);}, subscription_options);
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(odom_topic_, qos,
+      [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {odomCallback(msg);}, subscription_options);
+    initial_sub_ = create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(initial_topic_, 10,
+      [this](geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg) {initialCallback(msg);});
+    status_timer_ = create_wall_timer(std::chrono::milliseconds(200), [this]() {publishStatus();});
+    tf_timer_ = create_wall_timer(std::chrono::milliseconds(100), [this]() {publishTf();});
+    state_ = mode_ == "global" ? "WAITING_DATA" : "WAITING_INITIAL_POSE";
+    reason_ = mode_ == "global" ? "Waiting for fresh synchronized FAST-LIO data" : "Waiting for /initialpose";
+    publishStatus();
+    worker_ = std::thread([this]() {worker();});
+    RCLCPP_INFO(get_logger(), "Relocalization initialization_mode=%s", mode_.c_str());
+  }
 
-    pose_pub_ = create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      "/localization_pose", 10);
-
-    fitness_pub_ = create_publisher<std_msgs::msg::Float64>(
-      "/localization_fitness", 10);
-
-    tf_broadcaster_ =
-      std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-    loadGlobalMap();
-
-    // Receive fresh sensor data while NDT runs in the default group.
-    input_callback_group_ = create_callback_group(
-      rclcpp::CallbackGroupType::MutuallyExclusive);
-
-    rclcpp::SubscriptionOptions input_options;
-    input_options.callback_group = input_callback_group_;
-
-    auto input_qos = rclcpp::SensorDataQoS();
-    input_qos.keep_last(1);
-
-    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-      input_cloud_topic_,
-      input_qos,
-      std::bind(
-        &G1RelocalizationNode::cloudCallback,
-        this,
-        std::placeholders::_1),
-      input_options);
-
-    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-      odometry_topic_,
-      input_qos,
-      std::bind(
-        &G1RelocalizationNode::odomCallback,
-        this,
-        std::placeholders::_1),
-      input_options);
-
-    initial_pose_sub_ =
-      create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
-      initial_pose_topic_,
-      10,
-      std::bind(
-        &G1RelocalizationNode::initialPoseCallback,
-        this,
-        std::placeholders::_1));
-
-    timer_ = create_wall_timer(
-      std::chrono::milliseconds(localization_period_ms_),
-      std::bind(&G1RelocalizationNode::localizationTimer, this));
-
-    // Keep TF publishing independent from the slower NDT cycle.
-    // This callback group allows the TF timer to run while NDT is computing.
-    tf_callback_group_ = create_callback_group(
-      rclcpp::CallbackGroupType::MutuallyExclusive);
-
-    tf_timer_ = create_wall_timer(
-      std::chrono::milliseconds(100),
-      std::bind(&G1RelocalizationNode::tfTimer, this),
-      tf_callback_group_);
-
-    RCLCPP_INFO(
-      get_logger(),
-      "G1 relocalization node started. Waiting for /initialpose.");
+  ~G1RelocalizationNode() override
+  {
+    stopping_.store(true);
+    wake_.notify_all();
+    if (worker_.joinable()) {worker_.join();}
   }
 
 private:
-  void declareParameters()
+  struct Frame
   {
-    declare_parameter<std::string>("map_path", "");
-    declare_parameter<std::string>("global_frame", "map");
-    declare_parameter<std::string>("odom_frame", "camera_init");
-    declare_parameter<std::string>("body_frame", "body");
-    declare_parameter<double>("body_roll_deg", 180.0);
-
-    declare_parameter<std::string>(
-      "input_cloud_topic", "/cloud_registered_body");
-    declare_parameter<std::string>(
-      "odometry_topic", "/Odometry");
-    declare_parameter<std::string>(
-      "initial_pose_topic", "/initialpose");
-
-    declare_parameter<double>("map_voxel_size", 0.25);
-    declare_parameter<double>("scan_voxel_size", 0.20);
-
-    declare_parameter<double>("ndt_resolution", 1.0);
-    declare_parameter<double>("ndt_step_size", 0.1);
-    declare_parameter<double>(
-      "ndt_transformation_epsilon", 0.01);
-    declare_parameter<int>("ndt_max_iterations", 40);
-
-    declare_parameter<double>("fitness_threshold", 2.0);
-    declare_parameter<int>("localization_period_ms", 500);
-  }
+    Cloud::ConstPtr cloud;
+    int64_t stamp = 0;
+    Eigen::Matrix4f odom_T_body = Eigen::Matrix4f::Identity();
+  };
+  using Frames = std::vector<Frame, Eigen::aligned_allocator<Frame>>;
 
   void readParameters()
   {
-    get_parameter("map_path", map_path_);
-    get_parameter("global_frame", global_frame_);
-    get_parameter("odom_frame", odom_frame_);
-    get_parameter("body_frame", body_frame_);
-    get_parameter("body_roll_deg", body_roll_deg_);
-
-    get_parameter("input_cloud_topic", input_cloud_topic_);
-    get_parameter("odometry_topic", odometry_topic_);
-    get_parameter("initial_pose_topic", initial_pose_topic_);
-
-    get_parameter("map_voxel_size", map_voxel_size_);
-    get_parameter("scan_voxel_size", scan_voxel_size_);
-
-    get_parameter("ndt_resolution", ndt_resolution_);
-    get_parameter("ndt_step_size", ndt_step_size_);
-    get_parameter(
-      "ndt_transformation_epsilon",
-      ndt_transformation_epsilon_);
-    get_parameter("ndt_max_iterations", ndt_max_iterations_);
-
-    get_parameter("fitness_threshold", fitness_threshold_);
-    get_parameter(
-      "localization_period_ms",
-      localization_period_ms_);
-  }
-
-  void initializeBodyBaseTransform()
-  {
-    constexpr double kPi =
-      3.14159265358979323846;
-
-    const float roll_rad =
-      static_cast<float>(
-        body_roll_deg_ * kPi / 180.0);
-
-    // base_T_body：把FAST-LIO倒装body坐标
-    // 转换到机器人标准base坐标。
-    base_T_body_ =
-      Eigen::Matrix4f::Identity();
-
-    base_T_body_.block<3, 3>(0, 0) =
-      Eigen::AngleAxisf(
-        roll_rad,
-        Eigen::Vector3f::UnitX())
-      .toRotationMatrix();
-
-    body_T_base_ =
-      base_T_body_.inverse();
-  }
-
-  void loadGlobalMap()
-  {
-    if (map_path_.empty()) {
-      throw std::runtime_error("Parameter map_path is empty.");
-    }
-
-    auto raw_map = PointCloudT::Ptr(new PointCloudT());
-
-    if (pcl::io::loadPCDFile<PointT>(map_path_, *raw_map) < 0) {
-      throw std::runtime_error(
-        "Failed to load PCD map: " + map_path_);
-    }
-
-    map_cloud_ = PointCloudT::Ptr(new PointCloudT());
-
-    pcl::VoxelGrid<PointT> voxel_filter;
-    voxel_filter.setInputCloud(raw_map);
-    voxel_filter.setLeafSize(
-      static_cast<float>(map_voxel_size_),
-      static_cast<float>(map_voxel_size_),
-      static_cast<float>(map_voxel_size_));
-    voxel_filter.filter(*map_cloud_);
-
-    if (map_cloud_->empty()) {
-      throw std::runtime_error(
-        "Global map is empty after voxel filtering.");
-    }
-
-    ndt_.setInputTarget(map_cloud_);
-    ndt_.setResolution(ndt_resolution_);
-    ndt_.setStepSize(ndt_step_size_);
-    ndt_.setTransformationEpsilon(
-      ndt_transformation_epsilon_);
-    ndt_.setMaximumIterations(ndt_max_iterations_);
-
-    sensor_msgs::msg::PointCloud2 map_msg;
-    pcl::toROSMsg(*map_cloud_, map_msg);
-    map_msg.header.frame_id = global_frame_;
-    map_msg.header.stamp = now();
-    map_pub_->publish(map_msg);
-
-    RCLCPP_INFO(
-      get_logger(),
-      "Loaded map: %s, raw points=%zu, filtered points=%zu",
-      map_path_.c_str(),
-      raw_map->size(),
-      map_cloud_->size());
-  }
-
-  void cloudCallback(
-    const sensor_msgs::msg::PointCloud2::SharedPtr msg)
-  {
-    auto raw_scan = PointCloudT::Ptr(new PointCloudT());
-    pcl::fromROSMsg(*msg, *raw_scan);
-
-    if (raw_scan->empty()) {
-      return;
-    }
-
-    auto filtered_scan = PointCloudT::Ptr(new PointCloudT());
-
-    pcl::VoxelGrid<PointT> voxel_filter;
-    voxel_filter.setInputCloud(raw_scan);
-    voxel_filter.setLeafSize(
-      static_cast<float>(scan_voxel_size_),
-      static_cast<float>(scan_voxel_size_),
-      static_cast<float>(scan_voxel_size_));
-    voxel_filter.filter(*filtered_scan);
-
-    if (filtered_scan->size() < 100) {
-      return;
-    }
-
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    latest_scan_ = filtered_scan;
-    latest_scan_stamp_ = msg->header.stamp;
-    has_scan_ = true;
-  }
-
-  void odomCallback(
-    const nav_msgs::msg::Odometry::SharedPtr msg)
-  {
-    const Eigen::Matrix4f odom_body =
-      poseToMatrix(msg->pose.pose);
-
-    std::lock_guard<std::mutex> lock(data_mutex_);
-    odom_to_body_ = odom_body;
-    has_odom_ = true;
-  }
-
-  void initialPoseCallback(
-    const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)
-  {
-    if (!msg->header.frame_id.empty() &&
-        msg->header.frame_id != global_frame_) {
-      RCLCPP_WARN(
-        get_logger(),
-        "Initial pose frame is '%s', expected '%s'.",
-        msg->header.frame_id.c_str(),
-        global_frame_.c_str());
-    }
-
-    std::lock_guard<std::mutex> lock(data_mutex_);
-
-    // RViz的2D Pose Estimate表示map->base_link。
-    // NDT源点云位于FAST-LIO倒装body坐标系。
-    // 因此必须转换成map->body作为NDT初值。
-    initial_guess_map_body_ =
-      poseToMatrix(msg->pose.pose)
-      * base_T_body_;
-
-    has_initial_pose_ = true;
-    localized_ = false;
-
-    RCLCPP_INFO(
-      get_logger(),
-      "Received initial pose: x=%.3f, y=%.3f, z=%.3f",
-      msg->pose.pose.position.x,
-      msg->pose.pose.position.y,
-      msg->pose.pose.position.z);
-  }
-
-  void localizationTimer()
-  {
-    // 在首次NDT成功前，先发布单位变换，使map坐标系在RViz中存在。
-    // NDT成功后，map_to_odom_会被真实定位结果更新。
-    Eigen::Matrix4f current_map_odom;
+    auto str = [this](const char * key, const std::string & value) {
+      return declare_parameter<std::string>(key, value);
+    };
+    auto number = [this](const char * key, double value) {return declare_parameter<double>(key, value);};
+    auto integer = [this](const char * key, int value) {return declare_parameter<int>(key, value);};
+    auto boolean = [this](const char * key, bool value) {return declare_parameter<bool>(key, value);};
+    map_path_ = str("map_path", ""); mode_ = str("initialization_mode", "manual");
+    global_frame_ = str("global_frame", "map"); odom_frame_ = str("odom_frame", "camera_init");
+    body_frame_ = str("body_frame", "body"); body_roll_deg_ = number("body_roll_deg", 180.);
+    cloud_topic_ = str("input_cloud_topic", "/cloud_registered_body");
+    odom_topic_ = str("odometry_topic", "/Odometry"); initial_topic_ = str("initial_pose_topic", "/initialpose");
+    options_.map_voxel_size = number("map_voxel_size", .25);
+    options_.scan_voxel_size = number("scan_voxel_size", .20);
+    options_.ndt_resolution = number("ndt_resolution", 1.);
+    options_.ndt_step_size = number("ndt_step_size", .1);
+    options_.ndt_transformation_epsilon = number("ndt_transformation_epsilon", .01);
+    options_.ndt_max_iterations = integer("ndt_max_iterations", 40);
+    tracking_fitness_ = number("fitness_threshold", 2.);
+    period_ms_ = integer("localization_period_ms", 500);
+    max_scan_age_ = number("max_scan_age_sec", 2.);
+    valid_timeout_ = number("localization_valid_timeout_sec", 3.);
+    odom_gap_ = number("max_odom_sync_gap_sec", .1);
+    collect_seconds_ = number("global_collection_sec", 2.);
+    collect_timeout_ = number("global_collection_timeout_sec", 15.);
+    collection_frames_ = integer("global_min_scan_count", 10);
+    max_collection_points_ = integer("global_max_collection_points", 120000);
+    confirmation_frames_ = integer("confirmation_scan_count", 3);
+    verification_timeout_ = number("verification_timeout_sec", 20.);
+    confirmation_translation_ = number("confirmation_max_translation", .30);
+    confirmation_rotation_ = number("confirmation_max_rotation_deg", 10.) * kPi / 180.;
+    options_.time_budget_seconds = number("global_search_timeout_sec", 60.);
+    options_.use_search_bounds = boolean("global_use_search_bounds", false);
+    options_.min_x = number("global_min_x", -8.5); options_.max_x = number("global_max_x", 28.05);
+    options_.min_y = number("global_min_y", -26.5); options_.max_y = number("global_max_y", 25.05);
+    options_.use_ground_plane = boolean("global_use_ground_plane", true);
+    options_.level_from_ground_plane = boolean("global_level_from_ground_plane", false);
+    options_.ground_a = number("global_ground_a", -.06203);
+    options_.ground_b = number("global_ground_b", -.02687);
+    options_.ground_c = number("global_ground_c", -1.51);
+    options_.sensor_height = number("global_sensor_height", 1.51);
+    options_.initial_z = number("global_initial_z", 0.);
+    options_.map_roll_deg = number("global_map_roll_deg", 0.);
+    options_.map_pitch_deg = number("global_map_pitch_deg", 0.);
+    options_.min_scan_z = number("global_min_scan_z", -.8);
+    options_.max_scan_z = number("global_max_scan_z", 2.);
+    options_.max_scan_range = number("global_max_scan_range", 20.);
+    options_.grid_resolution = number("global_grid_resolution", .25);
+    options_.coarse_xy_step = number("global_coarse_xy_step", 1.);
+    options_.coarse_yaw_step_deg = number("global_coarse_yaw_step_deg", 10.);
+    options_.fine_xy_step = number("global_fine_xy_step", .25);
+    options_.fine_yaw_step_deg = number("global_fine_yaw_step_deg", 2.);
+    options_.retained_modes = integer("global_retained_modes", 96);
+    options_.ndt_candidates = integer("global_ndt_candidates", 12);
+    options_.min_correlative_score = number("global_min_correlative_score", .45);
+    options_.ambiguity_score_gap = number("global_ambiguity_score_gap", .08);
+    options_.unresolved_score_gap = number("global_unresolved_score_gap", .025);
+    options_.max_fitness = number("global_max_fitness", .6);
+    options_.coverage_distance = number("global_coverage_distance", .45);
+    options_.min_coverage = number("global_min_coverage", .65);
+    options_.max_inlier_rmse = number("global_max_inlier_rmse", .35);
+    if (mode_ != "manual" && mode_ != "global") {throw std::invalid_argument("initialization_mode must be manual or global");}
+    for (double v : {tracking_fitness_, max_scan_age_, valid_timeout_, odom_gap_, collect_seconds_,
+        collect_timeout_, verification_timeout_, confirmation_translation_, confirmation_rotation_})
     {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-      current_map_odom = map_to_odom_;
+      if (!std::isfinite(v) || v <= 0) {throw std::invalid_argument("Relocalization time/quality limits must be finite and positive");}
     }
-
-    builtin_interfaces::msg::Time current_stamp = now();
-    // TF is continuously published by tfTimer() at 10 Hz.
-
-    PointCloudT::Ptr scan;
-    Eigen::Matrix4f odom_body;
-    Eigen::Matrix4f guess;
-    builtin_interfaces::msg::Time scan_stamp;
-
-    {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-
-      if (!has_scan_ || !has_odom_) {
-        return;
-      }
-
-      if (!localized_ && !has_initial_pose_) {
-        return;
-      }
-
-      scan = latest_scan_;
-      odom_body = odom_to_body_;
-      scan_stamp = latest_scan_stamp_;
-
-      if (localized_) {
-        guess = map_to_odom_ * odom_body;
-      } else {
-        guess = initial_guess_map_body_;
-      }
-    }
-
-    const double diagnostic_scan_age =
-      now().seconds() - rclcpp::Time(scan_stamp).seconds();
-    const auto diagnostic_start = std::chrono::steady_clock::now();
-
-    ndt_.setInputSource(scan);
-
-    PointCloudT aligned_cloud;
-    ndt_.align(aligned_cloud, guess);
-
-    if (!ndt_.hasConverged()) {
-      RCLCPP_WARN(
-        get_logger(),
-        "NDT did not converge.");
-      return;
-    }
-
-    const double fitness = ndt_.getFitnessScore();
-
-    const double diagnostic_match_ms =
-      std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - diagnostic_start).count();
-
-    RCLCPP_INFO(
-      get_logger(),
-      "[NDT_DIAG] scan=%d.%09u age_at_start=%.3fs "
-      "match_ms=%.1f points=%zu fitness=%.6f",
-      static_cast<int>(scan_stamp.sec),
-      static_cast<unsigned int>(scan_stamp.nanosec),
-      diagnostic_scan_age,
-      diagnostic_match_ms,
-      scan->size(),
-      fitness);
-
-    std_msgs::msg::Float64 fitness_msg;
-    fitness_msg.data = fitness;
-    fitness_pub_->publish(fitness_msg);
-
-    if (!std::isfinite(fitness) ||
-        fitness > fitness_threshold_) {
-      RCLCPP_WARN(
-        get_logger(),
-        "NDT rejected: fitness=%.6f, threshold=%.6f",
-        fitness,
-        fitness_threshold_);
-      return;
-    }
-
-    const Eigen::Matrix4f map_body =
-      ndt_.getFinalTransformation();
-
-    const Eigen::Matrix4f map_odom =
-      map_body * odom_body.inverse();
-
-    {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-      map_to_odom_ = map_odom;
-      localized_ = true;
-    }
-
-    // map_to_odom_ has been updated above.
-    // tfTimer() continuously publishes the latest transform at 10 Hz.
-    publishLocalizationPose(map_body, scan_stamp);
-
-    ++successful_match_count_;
-
-    if (successful_match_count_ == 1 ||
-        successful_match_count_ % 10 == 0) {
-      RCLCPP_INFO(
-        get_logger(),
-        "NDT success: fitness=%.6f, x=%.3f, y=%.3f, z=%.3f",
-        fitness,
-        map_body(0, 3),
-        map_body(1, 3),
-        map_body(2, 3));
+    if (period_ms_ <= 0 || collection_frames_ < 2 || confirmation_frames_ < 2 ||
+      max_collection_points_ < 100 || !std::isfinite(body_roll_deg_))
+    {throw std::invalid_argument("Invalid collection/confirmation counts or body roll");}
+    if (max_scan_age_ > valid_timeout_ || valid_timeout_ > 3.) {
+      throw std::invalid_argument("Require max_scan_age_sec <= localization_valid_timeout_sec <= 3 seconds");
     }
   }
 
-  void tfTimer()
+  void loadMap()
   {
-    Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
-
-    {
-      std::lock_guard<std::mutex> lock(data_mutex_);
-
-      if (!localized_) {
-        return;
-      }
-
-      transform = map_to_odom_;
+    if (map_path_.empty()) {throw std::invalid_argument("map_path is empty");}
+    auto raw = Cloud::Ptr(new Cloud);
+    if (pcl::io::loadPCDFile(map_path_, *raw) < 0) {throw std::runtime_error("Cannot load PCD map: " + map_path_);}
+    auto finite = Cloud::Ptr(new Cloud);
+    for (const auto & point : *raw) {
+      if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) {finite->push_back(point);}
     }
-
-    publishTransform(transform);
-  }
-
-  void publishTransform(
-    const Eigen::Matrix4f & transform)
-  {
-    geometry_msgs::msg::TransformStamped tf_msg;
-
-    // Always publish the latest transform with a fresh timestamp.
-    tf_msg.header.stamp = this->now();
-    tf_msg.header.frame_id = global_frame_;
-    tf_msg.child_frame_id = odom_frame_;
-    tf_msg.transform = matrixToTransform(transform);
-
-    tf_broadcaster_->sendTransform(tf_msg);
-  }
-
-  void publishLocalizationPose(
-    const Eigen::Matrix4f & map_body,
-    const builtin_interfaces::msg::Time & stamp)
-  {
-    geometry_msgs::msg::PoseWithCovarianceStamped pose_msg;
-
-    pose_msg.header.stamp = stamp;
-    pose_msg.header.frame_id = global_frame_;
-    // 对外发布机器人标准base位姿，
-    // 而不是倒装IMU的body位姿。
-    const Eigen::Matrix4f map_base =
-      map_body * body_T_base_;
-
-    pose_msg.pose.pose =
-      matrixToPose(map_base);
-
-    pose_msg.pose.covariance.fill(0.0);
-
-    pose_pub_->publish(pose_msg);
-  }
-
-  static Eigen::Matrix4f poseToMatrix(
-    const geometry_msgs::msg::Pose & pose)
-  {
-    Eigen::Quaternionf quaternion(
-      static_cast<float>(pose.orientation.w),
-      static_cast<float>(pose.orientation.x),
-      static_cast<float>(pose.orientation.y),
-      static_cast<float>(pose.orientation.z));
-
-    if (quaternion.norm() < 1e-6f) {
-      quaternion = Eigen::Quaternionf::Identity();
-    } else {
-      quaternion.normalize();
+    if (options_.map_voxel_size <= 0 || !std::isfinite(options_.map_voxel_size)) {
+      throw std::invalid_argument("map_voxel_size must be finite and positive");
     }
-
-    Eigen::Matrix4f transform =
-      Eigen::Matrix4f::Identity();
-
-    transform.block<3, 3>(0, 0) =
-      quaternion.toRotationMatrix();
-
-    transform(0, 3) =
-      static_cast<float>(pose.position.x);
-    transform(1, 3) =
-      static_cast<float>(pose.position.y);
-    transform(2, 3) =
-      static_cast<float>(pose.position.z);
-
-    return transform;
+    map_ = filter(finite, options_.map_voxel_size);
+    if (map_->size() < 100) {throw std::invalid_argument("Map has fewer than 100 finite filtered points");}
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(*map_, msg); msg.header.frame_id = global_frame_; msg.header.stamp = now();
+    map_pub_->publish(msg);
+    RCLCPP_INFO(get_logger(), "Loaded %zu filtered PCD points", map_->size());
   }
 
-  static geometry_msgs::msg::Pose matrixToPose(
-    const Eigen::Matrix4f & transform)
+  static Cloud::Ptr filter(Cloud::ConstPtr input, double leaf)
   {
-    geometry_msgs::msg::Pose pose;
-
-    pose.position.x = transform(0, 3);
-    pose.position.y = transform(1, 3);
-    pose.position.z = transform(2, 3);
-
-    Eigen::Quaternionf quaternion(
-      transform.block<3, 3>(0, 0));
-    quaternion.normalize();
-
-    pose.orientation.x = quaternion.x();
-    pose.orientation.y = quaternion.y();
-    pose.orientation.z = quaternion.z();
-    pose.orientation.w = quaternion.w();
-
-    return pose;
-  }
-
-  static geometry_msgs::msg::Transform matrixToTransform(
-    const Eigen::Matrix4f & transform)
-  {
-    geometry_msgs::msg::Transform output;
-
-    output.translation.x = transform(0, 3);
-    output.translation.y = transform(1, 3);
-    output.translation.z = transform(2, 3);
-
-    Eigen::Quaternionf quaternion(
-      transform.block<3, 3>(0, 0));
-    quaternion.normalize();
-
-    output.rotation.x = quaternion.x();
-    output.rotation.y = quaternion.y();
-    output.rotation.z = quaternion.z();
-    output.rotation.w = quaternion.w();
-
+    auto output = Cloud::Ptr(new Cloud);
+    pcl::VoxelGrid<g1_relocalization::GlobalPoint> voxel;
+    voxel.setInputCloud(input); voxel.setLeafSize(leaf, leaf, leaf); voxel.filter(*output);
     return output;
   }
 
-  std::string map_path_;
-  std::string global_frame_;
-  std::string odom_frame_;
-  std::string body_frame_;
+  void cloudCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr msg)
+  {
+    const int64_t stamp = stampNs(msg->header.stamp);
+    if (msg->header.frame_id != body_frame_ ||
+      !g1_relocalization::freshStamp(stamp, now().nanoseconds(), max_scan_age_)) {return;}
+    auto raw = Cloud::Ptr(new Cloud);
+    pcl::fromROSMsg(*msg, *raw);
+    auto finite = Cloud::Ptr(new Cloud);
+    for (const auto & point : *raw) {
+      if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) {finite->push_back(point);}
+    }
+    if (finite->size() < 100) {return;}
+    auto cloud = filter(finite, options_.scan_voxel_size);
+    if (cloud->size() < 100) {return;}
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stamp <= last_received_scan_) {return;}
+    last_received_scan_ = stamp;
+    Frame frame; frame.cloud = cloud; frame.stamp = stamp;
+    pending_.push_back(frame);
+    while (pending_.size() > 30) {pending_.pop_front();}
+    wake_.notify_all();
+  }
 
-  std::string input_cloud_topic_;
-  std::string odometry_topic_;
-  std::string initial_pose_topic_;
+  void odomCallback(nav_msgs::msg::Odometry::ConstSharedPtr msg)
+  {
+    if (msg->header.frame_id != odom_frame_ || msg->child_frame_id != body_frame_ ||
+      !g1_relocalization::freshStamp(stampNs(msg->header.stamp), now().nanoseconds(), max_scan_age_)) {return;}
+    Eigen::Matrix4f pose;
+    if (!poseMatrix(msg->pose.pose, pose)) {return;}
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (poses_.add(stampNs(msg->header.stamp), pose)) {wake_.notify_all();}
+  }
 
-  double map_voxel_size_{0.25};
-  double scan_voxel_size_{0.20};
+  void initialCallback(geometry_msgs::msg::PoseWithCovarianceStamped::ConstSharedPtr msg)
+  {
+    if (!msg->header.frame_id.empty() && msg->header.frame_id != global_frame_) {
+      RCLCPP_WARN(get_logger(), "Rejected initialpose in wrong frame"); return;
+    }
+    Eigen::Matrix4f pose;
+    if (!poseMatrix(msg->pose.pose, pose)) {RCLCPP_WARN(get_logger(), "Rejected non-finite/zero-quaternion initialpose"); return;}
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      manual_guess_ = pose * base_T_body_;
+      has_manual_ = true; generation_.fetch_add(1); valid_ = false;
+      last_success_stamp_ = 0; fitness_ = std::numeric_limits<double>::infinity();
+      state_ = "VERIFYING"; reason_ = "Verifying manual initialpose on new scans";
+      pending_.clear();
+    }
+    publishFitness(std::numeric_limits<double>::infinity());
+    wake_.notify_all();
+  }
 
-  double ndt_resolution_{1.0};
-  double ndt_step_size_{0.1};
-  double ndt_transformation_epsilon_{0.01};
-  int ndt_max_iterations_{40};
+  bool nextFrame(Frame & frame)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    // Use the newest synchronized scan; do not build a stale processing backlog.
+    for (auto it = pending_.rbegin(); it != pending_.rend(); ++it) {
+      if (it->stamp <= last_processed_scan_ ||
+        !g1_relocalization::freshStamp(it->stamp, now().nanoseconds(), max_scan_age_)) {continue;}
+      if (!poses_.lookup(it->stamp, odom_gap_, frame.odom_T_body)) {continue;}
+      frame.cloud = it->cloud; frame.stamp = it->stamp;
+      last_processed_scan_ = frame.stamp;
+      while (!pending_.empty() && pending_.front().stamp <= frame.stamp) {pending_.pop_front();}
+      return true;
+    }
+    while (!pending_.empty() && !g1_relocalization::freshStamp(
+        pending_.front().stamp, now().nanoseconds(), max_scan_age_)) {pending_.pop_front();}
+    wake_.wait_for(lock, std::chrono::milliseconds(30));
+    return false;
+  }
 
-  double fitness_threshold_{2.0};
-  int localization_period_ms_{500};
-  double body_roll_deg_{180.0};
+  Cloud::Ptr gravityScan(const Frame & frame) const
+  {
+    auto result = Cloud::Ptr(new Cloud);
+    auto rotation = frame.odom_T_body;
+    rotation.block<3, 1>(0, 3).setZero();
+    pcl::transformPointCloud(*frame.cloud, *result, rotation);
+    return result;
+  }
 
-  PointCloudT::Ptr map_cloud_;
-  PointCloudT::Ptr latest_scan_;
+  void setState(const std::string & state, const std::string & reason, uint64_t generation)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (generation_.load() != generation) {return;}
+    if (state_ != state) {RCLCPP_INFO(get_logger(), "Localization state %s: %s", state.c_str(), reason.c_str());}
+    state_ = state; reason_ = reason; valid_ = false;
+  }
 
-  pcl::NormalDistributionsTransform<PointT, PointT> ndt_;
+  void publishFitness(double fitness)
+  {
+    std_msgs::msg::Float64 msg; msg.data = fitness; fitness_pub_->publish(msg);
+  }
 
-  Eigen::Matrix4f base_T_body_ =
-    Eigen::Matrix4f::Identity();
+  void worker()
+  {
+    try {runWorker();}
+    catch (const std::exception & error) {
+      setState("FAILED", std::string("Localization worker error: ") + error.what(), generation_.load());
+      publishFitness(std::numeric_limits<double>::infinity());
+      RCLCPP_ERROR(get_logger(), "Localization worker failed: %s", error.what());
+    }
+  }
 
-  Eigen::Matrix4f body_T_base_ =
-    Eigen::Matrix4f::Identity();
+  void runWorker()
+  {
+    pcl::NormalDistributionsTransform<g1_relocalization::GlobalPoint, g1_relocalization::GlobalPoint> ndt;
+    ndt.setInputTarget(map_); ndt.setResolution(options_.ndt_resolution);
+    ndt.setStepSize(options_.ndt_step_size); ndt.setTransformationEpsilon(options_.ndt_transformation_epsilon);
+    ndt.setMaximumIterations(options_.ndt_max_iterations);
+    uint64_t generation = std::numeric_limits<uint64_t>::max();
+    bool seeded = false, attempted = false, confirmed = false;
+    int confirmations = 0;
+    Frames collection;
+    Eigen::Matrix4f map_T_odom = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f anchor = map_T_odom;
+    auto collecting_since = Clock::now(), verifying_since = Clock::now(), last_track = Clock::now();
+    int64_t verification_after = 0;
+    while (!stopping_.load() && rclcpp::ok()) {
+      const uint64_t current_generation = generation_.load();
+      if (generation != current_generation) {
+        generation = current_generation; seeded = attempted = confirmed = false;
+        confirmations = 0; collection.clear(); verification_after = 0;
+        collecting_since = Clock::now();
+      }
+      // Timeouts also advance during an input outage. A failed attempt remains
+      // terminal until a new /initialpose changes the generation (or restart).
+      if (!confirmed && seeded && Clock::now() - verifying_since >
+        std::chrono::duration<double>(verification_timeout_))
+      {
+        seeded = false; attempted = true;
+        setState("FAILED", "Candidate did not pass fresh scan confirmation before timeout", generation);
+        publishFitness(std::numeric_limits<double>::infinity());
+      }
+      if (!seeded && !attempted && !collection.empty() && Clock::now() - collecting_since >
+        std::chrono::duration<double>(collect_timeout_))
+      {
+        collection.clear(); attempted = true;
+        setState("FAILED", "Unable to collect enough fresh synchronized scans", generation);
+      }
+      Frame frame;
+      if (!nextFrame(frame)) {continue;}
+      if (generation != generation_.load()) {continue;}
+      bool manual;
+      Eigen::Matrix4f manual_guess;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        manual = has_manual_; manual_guess = manual_guess_;
+        if (!valid_ && confirmed) {
+          confirmed = false; confirmations = 0; anchor = map_T_odom;
+          verifying_since = Clock::now();
+        }
+      }
+      if (!seeded && manual && !attempted) {
+        map_T_odom = manual_guess * frame.odom_T_body.inverse();
+        anchor = map_T_odom; seeded = true; verifying_since = Clock::now();
+        setState("VERIFYING", "Confirming supplied initialpose with independent fresh scans", generation);
+      }
+      if (!seeded && !manual) {
+        if (mode_ == "manual" || attempted) {continue;}
+        if (collection.empty()) {collecting_since = Clock::now();}
+        collection.push_back(frame);
+        setState("COLLECTING", "Accumulating synchronized scans without an initial pose", generation);
+        const double span = (collection.back().stamp - collection.front().stamp) / 1e9;
+        if (Clock::now() - collecting_since > std::chrono::duration<double>(collect_timeout_)) {
+          attempted = true; setState("FAILED", "Unable to collect enough fresh synchronized scans", generation); continue;
+        }
+        if (span < collect_seconds_ || int(collection.size()) < collection_frames_) {continue;}
+        auto accumulated = Cloud::Ptr(new Cloud);
+        const Eigen::Vector3f origin = frame.odom_T_body.block<3, 1>(0, 3);
+        for (const auto & item : collection) {
+          Cloud moved;
+          pcl::transformPointCloud(*item.cloud, moved, translation(-origin) * item.odom_T_body);
+          *accumulated += moved;
+          if (accumulated->size() > static_cast<std::size_t>(max_collection_points_)) {
+            accumulated = filter(accumulated, options_.scan_voxel_size);
+            if (accumulated->size() > static_cast<std::size_t>(max_collection_points_)) {break;}
+          }
+        }
+        accumulated = filter(accumulated, options_.scan_voxel_size);
+        if (accumulated->size() > static_cast<std::size_t>(max_collection_points_)) {
+          attempted = true; setState("FAILED", "Accumulated scan exceeds configured point budget", generation); continue;
+        }
+        setState("SEARCHING", "Searching the full configured map and all yaw angles", generation);
+        const auto result = matcher_->search(accumulated, [this, generation]() {
+            return stopping_.load() || generation != generation_.load() || !rclcpp::ok();});
+        if (generation != generation_.load() || stopping_.load()) {continue;}
+        attempted = true;
+        RCLCPP_INFO(get_logger(), "Global search %s in %.2fs (%zu evaluations): %s",
+          g1_relocalization::globalMatchStatusName(result.status), result.elapsed_seconds,
+          result.evaluations, result.reason.c_str());
+        if (result.status != g1_relocalization::GlobalMatchStatus::SUCCESS || result.candidates.empty()) {
+          setState(result.status == g1_relocalization::GlobalMatchStatus::AMBIGUOUS ? "AMBIGUOUS" : "FAILED",
+            result.reason, generation); collection.clear(); continue;
+        }
+        map_T_odom = result.candidates.front().map_T_scan * translation(-origin);
+        anchor = map_T_odom; seeded = true; confirmations = 0;
+        verification_after = frame.stamp; verifying_since = Clock::now(); collection.clear();
+        setState("VERIFYING", "Global candidate found; waiting for independent fresh scans", generation);
+        continue;
+      }
+      if (!seeded || frame.stamp <= verification_after) {continue;}
+      if (confirmed && Clock::now() - last_track < std::chrono::milliseconds(period_ms_)) {continue;}
+      last_track = Clock::now();
+      const auto guess = (map_T_odom * frame.odom_T_body).eval();
+      ndt.setInputSource(frame.cloud);
+      Cloud aligned; ndt.align(aligned, guess);
+      if (stopping_.load() || generation != generation_.load()) {continue;}
+      const double fitness = ndt.hasConverged() ? ndt.getFitnessScore() : std::numeric_limits<double>::infinity();
+      const auto fitted = ndt.getFinalTransformation().eval();
+      const auto candidate = (fitted * frame.odom_T_body.inverse()).eval();
+      auto quality = matcher_->evaluate(gravityScan(frame),
+        candidate * translation(frame.odom_T_body.block<3, 1>(0, 3)));
+      const bool stable = (candidate.block<3, 1>(0, 3) -
+          (confirmed ? map_T_odom : anchor).block<3, 1>(0, 3)).norm() <=
+        (confirmed ? .75 : confirmation_translation_) &&
+        rotationDistance(candidate, confirmed ? map_T_odom : anchor) <=
+        (confirmed ? .4 : confirmation_rotation_);
+      const bool accepted = ndt.hasConverged() && fitted.allFinite() && quality.acceptable && stable &&
+        std::isfinite(fitness) && fitness <= (confirmed ? tracking_fitness_ : options_.max_fitness) &&
+        g1_relocalization::freshStamp(frame.stamp, now().nanoseconds(), max_scan_age_);
+      if (!accepted) {
+        confirmations = 0;
+        setState(confirmed ? "LOST" : "VERIFYING", "NDT/coverage/stability/freshness confirmation rejected", generation);
+        if (confirmed) {confirmed = false; anchor = map_T_odom; verifying_since = Clock::now();}
+        publishFitness(std::numeric_limits<double>::infinity());
+        continue;
+      }
+      map_T_odom = candidate;
+      ++confirmations;
+      if (!confirmed && confirmations < confirmation_frames_) {
+        setState("VERIFYING", "Fresh independent confirmation " + std::to_string(confirmations) +
+          "/" + std::to_string(confirmation_frames_), generation); continue;
+      }
+      const bool first_success = !confirmed;
+      confirmed = true;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (generation != generation_.load()) {continue;}
+        map_T_odom_ = map_T_odom; last_success_stamp_ = frame.stamp;
+        last_success_steady_ = Clock::now(); fitness_ = fitness; coverage_ = quality.coverage;
+        valid_ = true; state_ = first_success ? "LOCALIZED" : "TRACKING";
+        reason_ = "Confirmed on distinct, fresh synchronized scans";
+      }
+      publishFitness(fitness);
+      geometry_msgs::msg::PoseWithCovarianceStamped pose;
+      pose.header.frame_id = global_frame_;
+      pose.header.stamp = rclcpp::Time(frame.stamp);
+      pose.pose.pose = matrixPose(fitted * base_T_body_.inverse());
+      // Fixed non-zero diagnostic covariance; not a calibrated uncertainty estimate.
+      pose.pose.covariance[0] = pose.pose.covariance[7] = pose.pose.covariance[14] = .04;
+      pose.pose.covariance[21] = pose.pose.covariance[28] = pose.pose.covariance[35] = .01;
+      pose_pub_->publish(pose);
+      if (first_success) {RCLCPP_INFO(get_logger(), "NDT success: confirmed fitness=%.6f coverage=%.3f", fitness, quality.coverage);}
+    }
+  }
 
-  Eigen::Matrix4f odom_to_body_ =
-    Eigen::Matrix4f::Identity();
+  void expireLocked(int64_t now_ns)
+  {
+    if (valid_ && (!g1_relocalization::freshStamp(last_success_stamp_, now_ns, valid_timeout_) ||
+      Clock::now() - last_success_steady_ > std::chrono::duration<double>(valid_timeout_)))
+    {
+      valid_ = false; state_ = "LOST"; reason_ = "Last successful sensor scan expired";
+    }
+  }
 
-  Eigen::Matrix4f initial_guess_map_body_ =
-    Eigen::Matrix4f::Identity();
+  void publishStatus()
+  {
+    const auto time = now();
+    std_msgs::msg::String msg;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      expireLocked(time.nanoseconds());
+      std::ostringstream out;
+      out << std::setprecision(10) << "{\"state\":" << quoted(state_) << ",\"valid\":" << (valid_ ? "true" : "false")
+          << ",\"reason\":" << quoted(reason_) << ",\"stamp_ns\":" << time.nanoseconds()
+          << ",\"last_success_stamp_ns\":" << last_success_stamp_
+          << ",\"fitness\":";
+      if (std::isfinite(fitness_)) {out << fitness_;} else {out << "null";}
+      out << ",\"coverage\":" << coverage_ << ",\"initialization_mode\":" << quoted(mode_) << "}";
+      msg.data = out.str();
+    }
+    status_pub_->publish(msg);
+  }
 
-  Eigen::Matrix4f map_to_odom_ =
-    Eigen::Matrix4f::Identity();
+  void publishTf()
+  {
+    const auto time = now();
+    Eigen::Matrix4f transform;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      expireLocked(time.nanoseconds());
+      if (!valid_) {return;}
+      transform = map_T_odom_;
+    }
+    const auto pose = matrixPose(transform);
+    geometry_msgs::msg::TransformStamped msg;
+    msg.header.stamp = time; msg.header.frame_id = global_frame_; msg.child_frame_id = odom_frame_;
+    msg.transform.translation.x = pose.position.x; msg.transform.translation.y = pose.position.y;
+    msg.transform.translation.z = pose.position.z; msg.transform.rotation = pose.orientation;
+    tf_->sendTransform(msg);
+  }
 
-  builtin_interfaces::msg::Time latest_scan_stamp_;
-
-  bool has_scan_{false};
-  bool has_odom_{false};
-  bool has_initial_pose_{false};
-  bool localized_{false};
-
-  std::size_t successful_match_count_{0};
-
-  std::mutex data_mutex_;
-
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr
-    cloud_sub_;
-
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr
-    odom_sub_;
-
-  rclcpp::Subscription<
-    geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
-    initial_pose_sub_;
-
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
-    map_pub_;
-
-  rclcpp::Publisher<
-    geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
-    pose_pub_;
-
-  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr
-    fitness_pub_;
-
-  std::unique_ptr<tf2_ros::TransformBroadcaster>
-    tf_broadcaster_;
-
-  rclcpp::CallbackGroup::SharedPtr input_callback_group_;
-  rclcpp::CallbackGroup::SharedPtr tf_callback_group_;
-
-  rclcpp::TimerBase::SharedPtr timer_;
-  rclcpp::TimerBase::SharedPtr tf_timer_;
+  std::string map_path_, mode_, global_frame_, odom_frame_, body_frame_, cloud_topic_, odom_topic_, initial_topic_;
+  double body_roll_deg_ = 180., tracking_fitness_ = 2., max_scan_age_ = 2., valid_timeout_ = 3., odom_gap_ = .1;
+  double collect_seconds_ = 2., collect_timeout_ = 15., verification_timeout_ = 20.;
+  double confirmation_translation_ = .3, confirmation_rotation_ = .1745;
+  int period_ms_ = 500, collection_frames_ = 10, confirmation_frames_ = 3, max_collection_points_ = 120000;
+  g1_relocalization::GlobalMatcherOptions options_;
+  Cloud::Ptr map_;
+  std::unique_ptr<g1_relocalization::GlobalMatcher> matcher_;
+  Eigen::Matrix4f base_T_body_ = Eigen::Matrix4f::Identity();
+  Eigen::Matrix4f map_T_odom_ = Eigen::Matrix4f::Identity(), manual_guess_ = Eigen::Matrix4f::Identity();
+  g1_relocalization::PoseBuffer poses_;
+  std::deque<Frame, Eigen::aligned_allocator<Frame>> pending_;
+  std::mutex mutex_; std::condition_variable wake_;
+  std::atomic<bool> stopping_{false}; std::atomic<uint64_t> generation_{0};
+  std::thread worker_;
+  bool has_manual_ = false, valid_ = false;
+  int64_t last_received_scan_ = 0, last_processed_scan_ = 0, last_success_stamp_ = 0;
+  Clock::time_point last_success_steady_{};
+  std::string state_ = "WAITING_DATA", reason_;
+  double fitness_ = std::numeric_limits<double>::infinity(), coverage_ = 0.;
+  rclcpp::CallbackGroup::SharedPtr input_group_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr pose_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr fitness_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_sub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_;
+  rclcpp::TimerBase::SharedPtr status_timer_, tf_timer_;
 };
 
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-
+  int result = 0;
   try {
-    auto node =
-      std::make_shared<G1RelocalizationNode>();
-
-    rclcpp::executors::MultiThreadedExecutor executor;
-    executor.add_node(node);
-    executor.spin();
+    auto node = std::make_shared<G1RelocalizationNode>();
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
+    executor.add_node(node); executor.spin();
   } catch (const std::exception & error) {
-    RCLCPP_FATAL(
-      rclcpp::get_logger("g1_relocalization"),
-      "%s",
-      error.what());
+    RCLCPP_FATAL(rclcpp::get_logger("g1_relocalization"), "%s", error.what()); result = 1;
   }
-
-  rclcpp::shutdown();
-  return 0;
+  if (rclcpp::ok()) {rclcpp::shutdown();}
+  return result;
 }

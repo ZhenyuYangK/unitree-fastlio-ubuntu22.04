@@ -217,6 +217,9 @@ struct GlobalMatcher::Impl
     const double width = std::ceil((feature_max_x - prototype.min_x) / prototype.resolution) + 1;
     const double height = std::ceil((feature_max_y - prototype.min_y) / prototype.resolution) + 1;
     const double layers = std::ceil((feature_max_z - prototype.min_z) / prototype.layer_height) + 2;
+    if (!(width >= 1.0 && height >= 1.0 && layers >= 1.0)) {
+      throw std::invalid_argument("Search bounds contain no observable map features");
+    }
     if (!std::isfinite(width * height * (layers + 1.0)) ||
       width * height * (layers + 1.0) > options.max_grid_cells || layers > 64.0)
     {

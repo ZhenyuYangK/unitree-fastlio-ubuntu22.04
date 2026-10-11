@@ -183,6 +183,12 @@ TEST(GlobalMatcher, InsufficientScanAndInvalidConfigurationFail)
   options = settings();
   options.max_grid_cells = 100;
   EXPECT_THROW(GlobalMatcher(room(), options), std::invalid_argument);
+  options = settings();
+  options.min_x = 100;
+  options.max_x = 110;
+  options.min_y = 100;
+  options.max_y = 110;
+  EXPECT_THROW(GlobalMatcher(room(), options), std::invalid_argument);
 }
 
 TEST(GlobalMatcher, GroundPlaneHeightAndGravityLevelAreRespected)

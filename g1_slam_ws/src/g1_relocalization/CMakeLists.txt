@@ -23,6 +23,7 @@ find_package(PCL REQUIRED COMPONENTS
   filters
   registration
 )
+find_package(Eigen3 REQUIRED)
 
 include_directories(
   include
@@ -33,6 +34,9 @@ add_definitions(${PCL_DEFINITIONS})
 
 add_library(global_matcher src/global_matcher.cpp)
 target_link_libraries(global_matcher ${PCL_LIBRARIES})
+
+add_executable(global_matcher_check src/global_matcher_check.cpp)
+target_link_libraries(global_matcher_check global_matcher ${PCL_LIBRARIES})
 
 add_executable(
   g1_relocalization_node
@@ -60,7 +64,7 @@ target_link_libraries(
 )
 
 install(
-  TARGETS g1_relocalization_node global_matcher
+  TARGETS g1_relocalization_node global_matcher global_matcher_check
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -74,6 +78,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_global_matcher test/test_global_matcher.cpp)
   target_link_libraries(test_global_matcher global_matcher ${PCL_LIBRARIES})
   ament_add_gtest(test_pose_buffer test/test_pose_buffer.cpp)
+  target_link_libraries(test_pose_buffer Eigen3::Eigen)
 endif()
 
 ament_package()

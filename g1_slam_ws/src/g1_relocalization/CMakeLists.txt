@@ -31,6 +31,9 @@ include_directories(
 
 add_definitions(${PCL_DEFINITIONS})
 
+add_library(global_matcher src/global_matcher.cpp)
+target_link_libraries(global_matcher ${PCL_LIBRARIES})
+
 add_executable(
   g1_relocalization_node
   src/g1_relocalization_node.cpp
@@ -52,11 +55,12 @@ ament_target_dependencies(
 
 target_link_libraries(
   g1_relocalization_node
+  global_matcher
   ${PCL_LIBRARIES}
 )
 
 install(
-  TARGETS g1_relocalization_node
+  TARGETS g1_relocalization_node global_matcher
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -64,5 +68,12 @@ install(
   DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_global_matcher test/test_global_matcher.cpp)
+  target_link_libraries(test_global_matcher global_matcher ${PCL_LIBRARIES})
+  ament_add_gtest(test_pose_buffer test/test_pose_buffer.cpp)
+endif()
 
 ament_package()

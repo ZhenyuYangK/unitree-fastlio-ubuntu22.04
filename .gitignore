@@ -1,5 +1,6 @@
 /\.vscode/
 /log/
+/doc/
 /g1_slam_ws/build/
 /g1_slam_ws/install/
 /g1_slam_ws/log/

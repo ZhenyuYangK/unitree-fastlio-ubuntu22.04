@@ -126,13 +126,14 @@ stop_from_pid_file() {
 }
 
 
+# ROS 列表检测时 grep 必须读完输入；-q 提前退出会触发 BrokenPipeError。
 wait_for_topic() {
   local topic="$1"
   local timeout_sec="${2:-30}"
   local elapsed=0
 
   while (( elapsed < timeout_sec )); do
-    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq "${topic}"; then
+    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fx "${topic}" >/dev/null; then
       ok "话题已出现：${topic}"
       return 0
     fi
@@ -148,7 +149,7 @@ wait_for_node() {
   local elapsed=0
 
   while (( elapsed < timeout_sec )); do
-    if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq "${node}"; then
+    if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx "${node}" >/dev/null; then
       ok "节点已出现：${node}"
       return 0
     fi
@@ -439,7 +440,7 @@ start_nav2_stack() {
     die "尚未检测到 NDT success，请先完成 2D Pose Estimate"
   fi
 
-  if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq /controller_server; then
+  if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /controller_server >/dev/null; then
     warn "Nav2 已经运行，跳过重复启动"
   else
     start_process \
@@ -459,7 +460,7 @@ start_nav2_stack() {
     check_file "${DRY_CFG}"
     check_package g1_loco_bridge
 
-    if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq /g1_cmd_vel_dry_run; then
+    if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /g1_cmd_vel_dry_run >/dev/null; then
       warn "Dry Run 安全桥已经运行"
     else
       start_process \
@@ -522,7 +523,7 @@ enable_dry() {
 
 disable_dry() {
   source_environment
-  if timeout 4 ros2 service list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq /g1_loco_bridge/enable; then
+  if timeout 4 ros2 service list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /g1_loco_bridge/enable >/dev/null; then
     ros2 service call \
       /g1_loco_bridge/enable \
       std_srvs/srv/SetBool \
@@ -572,7 +573,7 @@ show_status() {
     /plan \
     /cmd_vel_nav
   do
-    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq "${topic}"; then
+    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fx "${topic}" >/dev/null; then
       printf '[OK]   %s\n' "${topic}"
     else
       printf '[MISS] %s\n' "${topic}"
@@ -587,7 +588,7 @@ show_status() {
   done
 
   echo
-  if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq /g1_cmd_vel_dry_run; then
+  if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /g1_cmd_vel_dry_run >/dev/null; then
     ros2 param get /g1_cmd_vel_dry_run dry_run 2>/dev/null || true
     ros2 param get /g1_cmd_vel_dry_run cmd_vel_topic 2>/dev/null || true
   else

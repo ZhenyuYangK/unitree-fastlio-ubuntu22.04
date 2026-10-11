@@ -32,7 +32,8 @@ check_nav()
         fi
     done
 
-    ros2 topic list --no-daemon --spin-time 1 | grep -Fxq /cmd_vel_nav || {
+    # grep 必须读完整个列表，避免提前退出触发 BrokenPipeError/pipefail 误判。
+    ros2 topic list --no-daemon --spin-time 1 | grep -Fx /cmd_vel_nav >/dev/null || {
         echo "[ERROR] /cmd_vel_nav 不存在"
         exit 1
     }
@@ -46,7 +47,7 @@ start_bridge()
     check_nav
 
     if ros2 node list --no-daemon --spin-time 1 2>/dev/null |
-        grep -Fxq /g1_cmd_vel_dry_run
+        grep -Fx /g1_cmd_vel_dry_run >/dev/null
     then
         echo "[WARN] real bridge 已经运行"
         return
@@ -79,7 +80,7 @@ start_bridge()
     sleep 3
 
     ros2 node list --no-daemon --spin-time 1 |
-        grep -Fxq /g1_cmd_vel_dry_run || {
+        grep -Fx /g1_cmd_vel_dry_run >/dev/null || {
             echo "[ERROR] real bridge 启动失败"
             tail -n 80 "$LOG_FILE"
             exit 1
@@ -175,7 +176,7 @@ status()
     echo "===== Real bridge ====="
 
     if ros2 node list --no-daemon --spin-time 1 2>/dev/null |
-        grep -Fxq /g1_cmd_vel_dry_run
+        grep -Fx /g1_cmd_vel_dry_run >/dev/null
     then
         ros2 param get \
             /g1_cmd_vel_dry_run \

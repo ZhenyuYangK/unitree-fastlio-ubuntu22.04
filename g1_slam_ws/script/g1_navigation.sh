@@ -12,8 +12,10 @@ set -Eeuo pipefail
 # 用法：
 #   ./g1_navigation.sh start             手动初始化，启动定位 + Nav2
 #   ./g1_navigation.sh start-dry         手动初始化，并启动 Dry Run 安全桥
-#   ./g1_navigation.sh start-auto        使用 auto_start_pose.env 自动初始化
-#   ./g1_navigation.sh start-auto-dry    自动初始化，并启动 Dry Run 安全桥
+#   ./g1_navigation.sh start-auto        不给初始位置，自动全局定位后启动 Nav2
+#   ./g1_navigation.sh start-auto-dry    自动全局定位，并启动 Dry Run 安全桥
+#   ./g1_navigation.sh start-fixed       使用 auto_start_pose.env 中的固定坐标
+#   ./g1_navigation.sh start-fixed-dry   固定坐标初始化，并启动 Dry Run 安全桥
 #   ./g1_navigation.sh continue          定位已成功后继续启动 Nav2
 #   ./g1_navigation.sh continue-dry      定位已成功后继续启动 Nav2 + Dry Run
 #   ./g1_navigation.sh enable-dry
@@ -34,6 +36,8 @@ NAV2_SOURCE_PARAMS="${WS}/src/g1_nav2_bringup/config/nav2_params.yaml"
 NAV_RVIZ="${WS}/src/g1_nav2_bringup/rviz/navigation.rviz"
 DRY_CFG="${WS}/src/g1_loco_bridge/config/g1_loco_bridge_nav2_dry_run.yaml"
 AUTO_POSE_FILE="${SCRIPT_DIR}/auto_start_pose.env"
+LOCALIZATION_HELPER="${SCRIPT_DIR}/g1_wait_localization.py"
+LOCALIZATION_TIMEOUT_SEC="${G1_LOCALIZATION_TIMEOUT_SEC:-180.0}"
 
 RUNTIME_DIR="${WS}/runtime/navigation"
 LOG_DIR="${RUNTIME_DIR}/logs"
@@ -77,6 +81,18 @@ check_prerequisites() {
   check_file "${RELOC_CFG}"
   check_file "${NAV2_SOURCE_PARAMS}"
   check_file "${NAV_RVIZ}"
+  check_file "${LOCALIZATION_HELPER}"
+
+  # ROS 参数有固定类型，必须把环境变量中的整数也转换为浮点数。
+  LOCALIZATION_TIMEOUT_SEC="$(python3 - "${LOCALIZATION_TIMEOUT_SEC}" <<'PY'
+import math
+import sys
+value = float(sys.argv[1])
+if not math.isfinite(value) or value <= 0:
+    raise SystemExit("G1_LOCALIZATION_TIMEOUT_SEC 必须是有限的正数")
+print(repr(value))
+PY
+  )" || die "G1_LOCALIZATION_TIMEOUT_SEC 无效"
 
   source_environment
   g1_prepare_livox_config || die "雷达网卡配置检查失败"
@@ -290,7 +306,7 @@ activate_map_server() {
   ok "map_server 已激活"
 }
 
-publish_auto_pose() {
+publish_fixed_pose() {
   [[ -f "${AUTO_POSE_FILE}" ]] || die "找不到自动起点：${AUTO_POSE_FILE}"
   # shellcheck disable=SC1090
   source "${AUTO_POSE_FILE}"
@@ -319,28 +335,30 @@ PY
     "{header: {frame_id: map}, pose: {pose: {position: {x: ${AUTO_X}, y: ${AUTO_Y}, z: ${AUTO_Z}}, orientation: {x: 0.0, y: 0.0, z: ${qz}, w: ${qw}}}, covariance: [0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0685]}}"
 }
 
-wait_for_ndt_success() {
-  local timeout_sec="${1:-300}"
-  local elapsed=0
-  local log_file="${LOG_DIR}/relocalization.log"
+wait_for_localization() {
+  say "等待实时定位确认，最长 ${LOCALIZATION_TIMEOUT_SEC} 秒"
+  python3 "${LOCALIZATION_HELPER}" --timeout "${LOCALIZATION_TIMEOUT_SEC}"
+}
 
-  say "等待 NDT 定位成功，最长 ${timeout_sec} 秒"
+check_localization_ready() {
+  python3 "${LOCALIZATION_HELPER}" --once --timeout 5 \
+    || die "当前定位无效或不新鲜，已拒绝启动 Nav2；请检查 /g1_relocalization/status"
+}
 
-  while (( elapsed < timeout_sec )); do
-    if [[ -f "${log_file}" ]] && grep -q "NDT success" "${log_file}"; then
-      ok "检测到 NDT success"
-      tail -n 5 "${log_file}" | grep -E "Received initial pose|NDT success" || true
-      return 0
-    fi
-    sleep 1
-    ((elapsed += 1))
-  done
-
-  return 1
+check_dry_bridge() {
+  local dry_value input_topic
+  dry_value="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run dry_run 2>/dev/null || true)"
+  grep -Eq '^Boolean value is: True$' <<<"${dry_value}" \
+    || die "同名安全桥不是 dry_run=True；请停止真机桥后启动 Dry Run"
+  input_topic="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run cmd_vel_topic 2>/dev/null || true)"
+  grep -Eq '^String value is: /cmd_vel_nav$' <<<"${input_topic}" \
+    || die "已有安全桥的输入不是 /cmd_vel_nav，已拒绝继续"
 }
 
 start_base_stack() {
   local init_mode="$1"
+  local initialization_mode=manual
+  [[ "${init_mode}" != auto ]] || initialization_mode=global
 
   check_prerequisites
   stop_from_pid_file
@@ -370,7 +388,9 @@ start_base_stack() {
     ros2 run g1_relocalization g1_relocalization_node \
       --ros-args \
       --params-file "${RELOC_CFG}" \
-      -p map_path:="${MAP_PCD}"
+      -p map_path:="${MAP_PCD}" \
+      -p initialization_mode:="${initialization_mode}" \
+      -p global_search_timeout_sec:="${LOCALIZATION_TIMEOUT_SEC}"
 
   wait_for_topic /global_pcd_map 30 || die "未发布 /global_pcd_map"
 
@@ -392,7 +412,10 @@ start_base_stack() {
   wait_for_topic /map 20 || die "未出现 /map"
 
   if [[ "${init_mode}" == "auto" ]]; then
-    publish_auto_pose
+    say "正在自动搜索地图中的位置和朝向，无需发布初始位姿"
+    say "请保持机器人静止，等待采集点云、全局搜索和新扫描确认"
+  elif [[ "${init_mode}" == "fixed" ]]; then
+    publish_fixed_pose
   else
     echo
     say "请在 RViz 顶部点击 2D Pose Estimate"
@@ -436,8 +459,11 @@ start_nav2_stack() {
 
   source_environment
 
-  if ! grep -q "NDT success" "${LOG_DIR}/relocalization.log" 2>/dev/null; then
-    die "尚未检测到 NDT success，请先完成 2D Pose Estimate"
+  check_localization_ready
+
+  if [[ "${with_dry}" == "yes" ]] &&
+    timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /g1_cmd_vel_dry_run >/dev/null; then
+    check_dry_bridge
   fi
 
   if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /controller_server >/dev/null; then
@@ -461,6 +487,7 @@ start_nav2_stack() {
     check_package g1_loco_bridge
 
     if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /g1_cmd_vel_dry_run >/dev/null; then
+      check_dry_bridge
       warn "Dry Run 安全桥已经运行"
     else
       start_process \
@@ -471,9 +498,7 @@ start_nav2_stack() {
 
       wait_for_node /g1_cmd_vel_dry_run 20 || die "Dry Run 安全桥未启动"
 
-      local dry_value
-      dry_value="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run dry_run 2>/dev/null || true)"
-      grep -q "True" <<<"${dry_value}" || die "安全桥不是 dry_run=True，已拒绝继续"
+      check_dry_bridge
       ok "Dry Run 安全桥已启动，安全门保持关闭"
     fi
   fi
@@ -495,9 +520,10 @@ start_sequence() {
 
   start_base_stack "${init_mode}"
 
-  if ! wait_for_ndt_success 300; then
-    warn "等待 NDT 成功超时，但定位基础节点保持运行"
-    warn "完成 RViz 初始化后执行："
+  if ! wait_for_localization; then
+    warn "未能确认定位，Nav2 未启动；雷达、FAST-LIO、重定位和地图节点保持运行"
+    warn "可在 RViz 用 2D Pose Estimate 手动初始化（自动模式也支持人工后备）"
+    warn "定位状态变为有效后执行："
     if [[ "${with_dry}" == "yes" ]]; then
       warn "  ${SCRIPT_DIR}/g1_navigation.sh continue-dry"
     else
@@ -511,9 +537,8 @@ start_sequence() {
 
 enable_dry() {
   source_environment
-  local dry_value
-  dry_value="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run dry_run 2>/dev/null || true)"
-  grep -q "True" <<<"${dry_value}" || die "Dry Run 节点不存在或 dry_run 不是 True"
+  check_dry_bridge
+  check_localization_ready
 
   ros2 service call \
     /g1_loco_bridge/enable \
@@ -570,6 +595,7 @@ show_status() {
     /global_pcd_map \
     /map \
     /localization_pose \
+    /g1_relocalization/status \
     /plan \
     /cmd_vel_nav
   do
@@ -611,6 +637,8 @@ usage() {
   $0 start-dry
   $0 start-auto
   $0 start-auto-dry
+  $0 start-fixed
+  $0 start-fixed-dry
   $0 continue
   $0 continue-dry
   $0 enable-dry
@@ -621,9 +649,12 @@ usage() {
   $0 logs
 
 当前阶段推荐：
-  $0 start-dry
+  $0 start-auto
 
 说明：
+  start-auto 自动全局定位，无需初始位置或 auto_start_pose.env。
+  G1_LOCALIZATION_TIMEOUT_SEC 可设置等待时限，默认 180 秒。
+  start-fixed 使用 auto_start_pose.env 中的固定坐标。
   start-dry 只连接 DryRunBackend，不会向机器人发送真实运动命令。
 EOF_USAGE
 }
@@ -634,6 +665,8 @@ main() {
     start-dry) start_sequence manual yes ;;
     start-auto) start_sequence auto no ;;
     start-auto-dry) start_sequence auto yes ;;
+    start-fixed) start_sequence fixed no ;;
+    start-fixed-dry) start_sequence fixed yes ;;
     continue) start_nav2_stack no ;;
     continue-dry) start_nav2_stack yes ;;
     enable-dry) enable_dry ;;

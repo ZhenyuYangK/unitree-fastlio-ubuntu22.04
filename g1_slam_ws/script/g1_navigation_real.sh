@@ -11,10 +11,39 @@ RUNTIME="$WS/runtime/navigation"
 LOG_DIR="$RUNTIME/logs"
 PID_FILE="$RUNTIME/real_bridge.pid"
 LOG_FILE="$LOG_DIR/real_bridge.log"
+LOCALIZATION_HELPER="${SCRIPT_DIR}/g1_wait_localization.py"
 
 mkdir -p "$LOG_DIR"
 
 load_env() { g1_source_environment; }
+
+check_localization()
+{
+    python3 "$LOCALIZATION_HELPER" --once --timeout 5 || {
+        echo "[ERROR] 当前定位无效或不新鲜，已拒绝启动/启用真机桥"
+        return 1
+    }
+}
+
+check_real_bridge()
+{
+    local value topic service
+    value="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run dry_run 2>/dev/null || true)"
+    grep -Eq '^Boolean value is: False$' <<<"$value" || {
+        echo "[ERROR] 同名节点不是 dry_run=False；请先停止 Dry Run 桥"
+        return 1
+    }
+    topic="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run cmd_vel_topic 2>/dev/null || true)"
+    grep -Eq '^String value is: /cmd_vel_nav$' <<<"$topic" || {
+        echo "[ERROR] 安全桥输入不是 /cmd_vel_nav"
+        return 1
+    }
+    service="$(timeout 8 ros2 param get /g1_cmd_vel_dry_run enable_service_name 2>/dev/null || true)"
+    grep -Eq '^String value is: /g1_loco_bridge/enable_real_nav$' <<<"$service" || {
+        echo "[ERROR] 安全桥不是导航真机配置，启用服务不匹配"
+        return 1
+    }
+}
 
 check_nav()
 {
@@ -45,11 +74,13 @@ start_bridge()
 {
     load_env
     check_nav
+    check_localization
 
     if ros2 node list --no-daemon --spin-time 1 2>/dev/null |
         grep -Fx /g1_cmd_vel_dry_run >/dev/null
     then
-        echo "[WARN] real bridge 已经运行"
+        check_real_bridge || exit 1
+        echo "[WARN] 真机安全桥已经运行"
         return
     fi
 
@@ -86,22 +117,7 @@ start_bridge()
             exit 1
         }
 
-    value="$(ros2 param get \
-        /g1_cmd_vel_dry_run \
-        dry_run)"
-
-    grep -q False <<<"$value" || {
-        echo "[ERROR] dry_run 不是 False"
-        stop_bridge
-        exit 1
-    }
-
-    topic="$(ros2 param get \
-        /g1_cmd_vel_dry_run \
-        cmd_vel_topic)"
-
-    grep -q /cmd_vel_nav <<<"$topic" || {
-        echo "[ERROR] 输入不是 /cmd_vel_nav"
+    check_real_bridge || {
         stop_bridge
         exit 1
     }
@@ -113,6 +129,9 @@ start_bridge()
 enable_bridge()
 {
     load_env
+    check_nav
+    check_real_bridge || exit 1
+    check_localization
 
     echo
     echo "[WARN] 即将允许 Nav2 控制真实 G1"

@@ -159,10 +159,8 @@ class RelocalizationNodeTest(unittest.TestCase):
             points = np.concatenate((points, points + np.array([14.0, 0.0, 0.0])))
         map_path = Path(self.directory.name) / "map.pcd"
         write_pcd(map_path, points)
-        self.diagnostics = Path(self.directory.name) / "search diagnostics"
         parameters = {
             "map_path": str(map_path), "initialization_mode": mode,
-            "diagnostics_dir": str(self.diagnostics),
             "input_cloud_topic": "/relocalization_test/cloud",
             "odometry_topic": "/relocalization_test/odom",
             "initial_pose_topic": "/relocalization_test/initialpose",
@@ -265,27 +263,6 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.assertFalse(self.transforms, self.log_text())
         self.assertFalse(any(math.isfinite(value.data) for value in self.fitnesses), self.log_text())
 
-    def assert_search_report(self, expected_status):
-        reports = list(self.diagnostics.glob('global_*.json'))
-        self.assertEqual(len(reports), 1, self.log_text())
-        report = json.loads(reports[0].read_text())
-        self.assertEqual(report['status'], expected_status)
-        self.assertEqual(report['schema_version'], 1)
-        self.assertGreater(report['reference_stamp_ns'], 0)
-        np.testing.assert_allclose(np.array(report['reference_odom_T_body'])[:3, 3],
-                                   ODOM_POSITION, atol=1e-5)
-        self.assertGreater(report['refined_modes'], 0)
-        self.assertLessEqual(report['refined_modes'], report['matcher_options']['ndt_max_candidates'])
-        self.assertTrue(report['candidates'])
-        self.assertTrue(all(type(c['acceptable']) is bool for c in report['candidates']))
-        payload = Path(report['scan_path']).read_bytes()
-        header, binary = payload.split(b'DATA binary\n', 1)
-        count = next(int(line.split()[1]) for line in header.splitlines()
-                     if line.startswith(b'POINTS '))
-        self.assertGreaterEqual(count, 100)
-        self.assertEqual(len(binary), count * 16)
-        self.assertIn('odom gravity', report['scan_coordinates'])
-
     def assert_correct_localization(self):
         self.wait_for(lambda: self.poses and self.transforms and self.statuses[-1]["valid"],
                       sensor=True)
@@ -319,7 +296,6 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.assert_no_localization()
         # There is deliberately no initial_pose() call before automatic success.
         self.assert_correct_localization()
-        self.assert_search_report('success')
         self.assertTrue(any(status["state"] == "COLLECTING" for status in self.statuses))
         self.assertEqual(self.statuses[-1]["initialization_mode"], "global")
         self.pump(0.3, sensor=True, repeat=True)  # Drain any earlier fresh observation.
@@ -339,7 +315,6 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.wait_for(lambda: self.statuses[-1]["state"] in ("AMBIGUOUS", "FAILED"),
                       sensor=True)
         self.assertEqual(self.statuses[-1]["state"], "AMBIGUOUS", self.log_text())
-        self.assert_search_report('ambiguous')
         self.pump(0.4, sensor=True)
         self.assert_no_localization()
         self.initial_pose()
@@ -384,11 +359,6 @@ class RelocalizationNodeTest(unittest.TestCase):
                                 text=True, timeout=10)
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("Cannot load PCD map", result.stdout)
-
-    def test_diagnostics_failure_does_not_block_localization(self):
-        self.launch(diagnostics_dir=str(Path(self.directory.name) / 'map.pcd' / 'blocked'))
-        self.assert_correct_localization()
-        self.assertIn('Cannot save diagnostics', self.log_text())
 
 
 if __name__ == "__main__":

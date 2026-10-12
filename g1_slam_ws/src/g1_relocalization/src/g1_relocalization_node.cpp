@@ -5,8 +5,6 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
-#include <fstream>
-#include <cerrno>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -16,7 +14,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <sys/stat.h>
 
 #include <Eigen/Geometry>
 #include <rclcpp/rclcpp.hpp>
@@ -91,34 +88,6 @@ geometry_msgs::msg::Pose matrixPose(const Eigen::Matrix4f & matrix)
   pose.orientation.z = q.z(); pose.orientation.w = q.w();
   return pose;
 }
-void jsonNumber(std::ostream & out, double value)
-{
-  if (std::isfinite(value)) {out << value;} else {out << "null";}
-}
-void jsonMatrix(std::ostream & out, const Eigen::Matrix4f & matrix)
-{
-  out << '[';
-  for (int row = 0; row < 4; ++row) {
-    if (row) {out << ',';}
-    out << '[';
-    for (int col = 0; col < 4; ++col) {
-      if (col) {out << ',';}
-      jsonNumber(out, matrix(row, col));
-    }
-    out << ']';
-  }
-  out << ']';
-}
-void createDirectories(const std::string & path)
-{
-  for (std::size_t i = 1; i <= path.size(); ++i) {
-    if (i != path.size() && path[i] != '/') {continue;}
-    const auto part = path.substr(0, i);
-    if (::mkdir(part.c_str(), 0755) != 0 && errno != EEXIST) {
-      throw std::runtime_error("Cannot create localization diagnostics directory: " + part);
-    }
-  }
-}
 }  // namespace
 
 class G1RelocalizationNode : public rclcpp::Node
@@ -184,7 +153,6 @@ private:
     auto integer = [this](const char * key, int value) {return declare_parameter<int>(key, value);};
     auto boolean = [this](const char * key, bool value) {return declare_parameter<bool>(key, value);};
     map_path_ = str("map_path", ""); mode_ = str("initialization_mode", "manual");
-    diagnostics_dir_ = str("diagnostics_dir", "");
     global_frame_ = str("global_frame", "map"); odom_frame_ = str("odom_frame", "camera_init");
     body_frame_ = str("body_frame", "body"); body_roll_deg_ = number("body_roll_deg", 180.);
     cloud_topic_ = str("input_cloud_topic", "/cloud_registered_body");
@@ -231,11 +199,6 @@ private:
     options_.fine_yaw_step_deg = number("global_fine_yaw_step_deg", 2.);
     options_.retained_modes = integer("global_retained_modes", 96);
     options_.ndt_candidates = integer("global_ndt_candidates", 12);
-    options_.ndt_max_candidates = integer("global_ndt_max_candidates", 48);
-    options_.icp_max_iterations = integer("icp_max_iterations", 20);
-    options_.icp_correspondence_distance = number("icp_correspondence_distance", .45);
-    options_.icp_max_translation = number("icp_max_translation", .50);
-    options_.icp_max_rotation_deg = number("icp_max_rotation_deg", 10.);
     options_.min_correlative_score = number("global_min_correlative_score", .45);
     options_.ambiguity_score_gap = number("global_ambiguity_score_gap", .08);
     options_.unresolved_score_gap = number("global_unresolved_score_gap", .025);
@@ -378,99 +341,6 @@ private:
     std_msgs::msg::Float64 msg; msg.data = fitness; fitness_pub_->publish(msg);
   }
 
-  void saveSearchDiagnostics(const Frame & reference, Cloud::ConstPtr scan,
-    const g1_relocalization::GlobalMatchResult & result, uint64_t generation)
-  {
-    for (std::size_t i = 0; i < result.candidates.size(); ++i) {
-      const auto & candidate = result.candidates[i];
-      RCLCPP_INFO(get_logger(),
-        "Global candidate %zu: accepted=%d converged=%d geometry_rejected=%d "
-        "xyz=[%.3f,%.3f,%.3f] yaw=%.1f corr=%.3f fitness=%.4f coverage=%.3f rmse=%.3f score=%.3f",
-        i, int(candidate.acceptable), int(candidate.converged), int(candidate.geometry_rejected),
-        candidate.map_T_scan(0, 3), candidate.map_T_scan(1, 3), candidate.map_T_scan(2, 3),
-        std::atan2(candidate.map_T_scan(1, 0), candidate.map_T_scan(0, 0)) * 180. / kPi,
-        candidate.correlative_score, candidate.fitness, candidate.quality.coverage,
-        candidate.quality.inlier_rmse, candidate.quality.score);
-    }
-    if (diagnostics_dir_.empty()) {return;}
-    try {
-      createDirectories(diagnostics_dir_);
-      const std::string stem = diagnostics_dir_ + "/global_" + std::to_string(reference.stamp) +
-        "_g" + std::to_string(generation);
-      if (pcl::io::savePCDFileBinary(stem + ".pcd", *scan) < 0) {
-        throw std::runtime_error("Cannot save global-search scan PCD");
-      }
-      std::ofstream out(stem + ".json");
-      if (!out) {throw std::runtime_error("Cannot save global-search report JSON");}
-      out << std::setprecision(10) << "{\"schema_version\":1,\"map_path\":" << quoted(map_path_)
-          << ",\"scan_path\":" << quoted(stem + ".pcd")
-          << ",\"scan_coordinates\":\"odom gravity axes centered at reference body origin\""
-          << ",\"reference_stamp_ns\":" << reference.stamp << ",\"reference_odom_T_body\":";
-      jsonMatrix(out, reference.odom_T_body);
-      out << ",\"status\":" << quoted(g1_relocalization::globalMatchStatusName(result.status))
-          << ",\"reason\":" << quoted(result.reason) << ",\"elapsed_seconds\":" << result.elapsed_seconds
-          << ",\"evaluations\":" << result.evaluations << ",\"retained_modes\":" << result.retained_modes
-          << ",\"refined_modes\":" << result.refined_modes << ",\"merged_modes\":" << result.merged_modes
-          << ",\"geometry_rejected_modes\":" << result.geometry_rejected_modes
-          << ",\"competing_modes\":" << result.competing_modes << ",\"unresolved_modes\":" << result.unresolved_modes
-          << ",\"unrefined_modes\":" << result.unrefined_modes
-          << ",\"matcher_options\":{\"use_search_bounds\":" << (options_.use_search_bounds ? "true" : "false")
-          << ",\"min_x\":" << options_.min_x << ",\"max_x\":" << options_.max_x
-          << ",\"min_y\":" << options_.min_y << ",\"max_y\":" << options_.max_y
-          << ",\"use_ground_plane\":" << (options_.use_ground_plane ? "true" : "false")
-          << ",\"level_from_ground_plane\":" << (options_.level_from_ground_plane ? "true" : "false")
-          << ",\"ground_a\":" << options_.ground_a << ",\"ground_b\":" << options_.ground_b
-          << ",\"ground_c\":" << options_.ground_c << ",\"sensor_height\":" << options_.sensor_height
-          << ",\"initial_z\":" << options_.initial_z << ",\"map_roll_deg\":" << options_.map_roll_deg
-          << ",\"map_pitch_deg\":" << options_.map_pitch_deg
-          << ",\"map_voxel_size\":" << options_.map_voxel_size << ",\"scan_voxel_size\":" << options_.scan_voxel_size
-          << ",\"ndt_resolution\":" << options_.ndt_resolution
-          << ",\"ndt_step_size\":" << options_.ndt_step_size
-          << ",\"ndt_transformation_epsilon\":" << options_.ndt_transformation_epsilon
-          << ",\"ndt_max_iterations\":" << options_.ndt_max_iterations
-          << ",\"min_scan_z\":" << options_.min_scan_z << ",\"max_scan_z\":" << options_.max_scan_z
-          << ",\"max_scan_range\":" << options_.max_scan_range
-          << ",\"coarse_xy_step\":" << options_.coarse_xy_step
-          << ",\"coarse_yaw_step_deg\":" << options_.coarse_yaw_step_deg
-          << ",\"fine_xy_step\":" << options_.fine_xy_step << ",\"fine_yaw_step_deg\":" << options_.fine_yaw_step_deg
-          << ",\"retained_modes\":" << options_.retained_modes
-          << ",\"ndt_candidates\":" << options_.ndt_candidates
-          << ",\"ndt_max_candidates\":" << options_.ndt_max_candidates
-          << ",\"icp_max_iterations\":" << options_.icp_max_iterations
-          << ",\"icp_correspondence_distance\":" << options_.icp_correspondence_distance
-          << ",\"icp_max_translation\":" << options_.icp_max_translation
-          << ",\"icp_max_rotation_deg\":" << options_.icp_max_rotation_deg
-          << ",\"max_fitness\":" << options_.max_fitness << ",\"coverage_distance\":" << options_.coverage_distance
-          << ",\"min_coverage\":" << options_.min_coverage << ",\"max_inlier_rmse\":" << options_.max_inlier_rmse
-          << ",\"ambiguity_score_gap\":" << options_.ambiguity_score_gap
-          << ",\"unresolved_score_gap\":" << options_.unresolved_score_gap << "},\"candidates\":[";
-      for (std::size_t i = 0; i < result.candidates.size(); ++i) {
-        if (i) {out << ',';}
-        const auto & candidate = result.candidates[i];
-        out << "{\"acceptable\":" << (candidate.acceptable ? "true" : "false")
-            << ",\"converged\":" << (candidate.converged ? "true" : "false")
-            << ",\"geometry_rejected\":" << (candidate.geometry_rejected ? "true" : "false")
-            << ",\"correlative_score\":" << candidate.correlative_score << ",\"fitness\":";
-        jsonNumber(out, candidate.fitness);
-        out << ",\"coverage\":" << candidate.quality.coverage << ",\"inlier_rmse\":";
-        jsonNumber(out, candidate.quality.inlier_rmse);
-        out << ",\"score\":" << candidate.quality.score
-            << ",\"initial_coverage\":" << candidate.initial_quality.coverage
-            << ",\"map_T_scan\":";
-        jsonMatrix(out, candidate.map_T_scan);
-        out << ",\"initial_map_T_scan\":";
-        jsonMatrix(out, candidate.initial_map_T_scan);
-        out << '}';
-      }
-      out << "]}\n";
-      out.close();
-      if (!out) {throw std::runtime_error("Global-search report write failed");}
-      RCLCPP_INFO(get_logger(), "Saved global-search diagnostics: %s.{pcd,json}", stem.c_str());
-    } catch (const std::exception & error) {
-      RCLCPP_WARN(get_logger(), "Cannot save diagnostics: %s", error.what());
-    }
-  }
-
   void worker()
   {
     try {runWorker();}
@@ -565,7 +435,6 @@ private:
             return stopping_.load() || generation != generation_.load() || !rclcpp::ok();});
         if (generation != generation_.load() || stopping_.load()) {continue;}
         attempted = true;
-        saveSearchDiagnostics(frame, accumulated, result, generation);
         RCLCPP_INFO(get_logger(), "Global search %s in %.2fs (%zu evaluations): %s",
           g1_relocalization::globalMatchStatusName(result.status), result.elapsed_seconds,
           result.evaluations, result.reason.c_str());
@@ -586,22 +455,11 @@ private:
       ndt.setInputSource(frame.cloud);
       Cloud aligned; ndt.align(aligned, guess);
       if (stopping_.load() || generation != generation_.load()) {continue;}
-      double fitness = ndt.hasConverged() ? ndt.getFitnessScore() : std::numeric_limits<double>::infinity();
-      auto fitted = ndt.getFinalTransformation().eval();
-      auto candidate = (fitted * frame.odom_T_body.inverse()).eval();
-      const auto gravity_scan = gravityScan(frame);
-      const auto origin = frame.odom_T_body.block<3, 1>(0, 3).eval();
-      if (ndt.hasConverged() && fitted.allFinite()) {
-        const auto polished = matcher_->polish(gravity_scan, candidate * translation(origin),
-          [this, generation]() {return stopping_.load() || generation != generation_.load() || !rclcpp::ok();});
-        if (stopping_.load() || generation != generation_.load()) {continue;}
-        if (polished.applied) {
-          candidate = polished.map_T_scan * translation(-origin);
-          fitted = candidate * frame.odom_T_body;
-          fitness = polished.fitness;
-        }
-      }
-      auto quality = matcher_->evaluate(gravity_scan, candidate * translation(origin));
+      const double fitness = ndt.hasConverged() ? ndt.getFitnessScore() : std::numeric_limits<double>::infinity();
+      const auto fitted = ndt.getFinalTransformation().eval();
+      const auto candidate = (fitted * frame.odom_T_body.inverse()).eval();
+      auto quality = matcher_->evaluate(gravityScan(frame),
+        candidate * translation(frame.odom_T_body.block<3, 1>(0, 3)));
       const bool stable = (candidate.block<3, 1>(0, 3) -
           (confirmed ? map_T_odom : anchor).block<3, 1>(0, 3)).norm() <=
         (confirmed ? .75 : confirmation_translation_) &&
@@ -692,7 +550,7 @@ private:
     tf_->sendTransform(msg);
   }
 
-  std::string map_path_, mode_, diagnostics_dir_, global_frame_, odom_frame_, body_frame_, cloud_topic_, odom_topic_, initial_topic_;
+  std::string map_path_, mode_, global_frame_, odom_frame_, body_frame_, cloud_topic_, odom_topic_, initial_topic_;
   double body_roll_deg_ = 180., tracking_fitness_ = 2., max_scan_age_ = 2., valid_timeout_ = 3., odom_gap_ = .1;
   double collect_seconds_ = 2., collect_timeout_ = 15., verification_timeout_ = 20.;
   double confirmation_translation_ = .3, confirmation_rotation_ = .1745;

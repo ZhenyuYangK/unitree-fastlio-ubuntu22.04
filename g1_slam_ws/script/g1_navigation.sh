@@ -390,6 +390,7 @@ start_base_stack() {
       --params-file "${RELOC_CFG}" \
       -p map_path:="${MAP_PCD}" \
       -p initialization_mode:="${initialization_mode}" \
+      -p diagnostics_dir:="${WS}/runtime/relocalization" \
       -p global_search_timeout_sec:="${LOCALIZATION_TIMEOUT_SEC}"
 
   wait_for_topic /global_pcd_map 30 || die "未发布 /global_pcd_map"

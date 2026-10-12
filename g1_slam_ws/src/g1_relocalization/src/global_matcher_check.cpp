@@ -40,6 +40,8 @@ void usage()
     "  --bounds MIN_X MAX_X MIN_Y MAX_Y   Restrict body XY search in levelled map\n"
     "                                     frame (default: all structural map bounds)\n"
     "  --timeout SECONDS                 Search budget (default: 60)\n"
+    "  --ndt-candidates COUNT            Initial refinement batch (default: 12)\n"
+    "  --ndt-max-candidates COUNT        Adaptive refinement limit (default: 48)\n"
     "  --ground-plane A B C HEIGHT       z=A*x+B*y+C; body height above floor\n"
     "                                     (default: -0.06203 -0.02687 -1.51 1.51)\n"
     "  --initial-z Z                     Fixed body Z; disables ground plane\n"
@@ -100,6 +102,14 @@ int main(int argc, char ** argv)
         options.min_y = number(argv[++i]); options.max_y = number(argv[++i]);
       } else if (key == "--timeout") {
         require(1); options.time_budget_seconds = number(argv[++i]);
+      } else if (key == "--ndt-candidates" || key == "--ndt-max-candidates") {
+        require(1);
+        const double count = number(argv[++i]);
+        if (count < 2 || count > 100000 || count != std::floor(count)) {
+          throw std::invalid_argument("Refinement count must be an integer >= 2 and <= 100000");
+        }
+        (key == "--ndt-candidates" ? options.ndt_candidates : options.ndt_max_candidates) =
+          static_cast<int>(count);
       } else if (key == "--ground-plane") {
         require(4); options.use_ground_plane = true;
         options.ground_a = number(argv[++i]); options.ground_b = number(argv[++i]);
@@ -154,6 +164,9 @@ int main(int argc, char ** argv)
                 << " fitness=" << candidate.fitness << " coverage=" << candidate.quality.coverage
                 << " inlier_rmse=" << candidate.quality.inlier_rmse
                 << " evaluated_points=" << candidate.quality.evaluated_points
+                << " geometry_rejected=" << candidate.geometry_rejected
+                << " initial_coverage=" << candidate.initial_quality.coverage
+                << " score=" << candidate.quality.score
                 << " xyz=" << transform(0, 3) << ',' << transform(1, 3) << ',' << transform(2, 3)
                 << " yaw_deg=" << std::atan2(transform(1, 0), transform(0, 0)) * 180.0 / kPi
                 << " quaternion_wxyz=" << q.w() << ',' << q.x() << ',' << q.y() << ',' << q.z() << '\n';

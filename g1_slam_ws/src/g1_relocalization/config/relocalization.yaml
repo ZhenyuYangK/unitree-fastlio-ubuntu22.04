@@ -4,6 +4,8 @@ g1_relocalization:
     map_path: ""
     # start-auto 在命令行覆盖为 global；手动入口继续等待 /initialpose。
     initialization_mode: "manual"
+    # 脚本自动设置 runtime/relocalization；每次搜索保存精确输入 PCD 和候选 JSON。
+    diagnostics_dir: ""
 
     global_frame: "map"
     odom_frame: "camera_init"
@@ -55,6 +57,14 @@ g1_relocalization:
     global_fine_yaw_step_deg: 2.0
     global_retained_modes: 96
     global_ndt_candidates: 12
+    # 前 12 个候选后，按歧义需要继续验证；最多 48 个，剩余可信模式仍拒绝。
+    global_ndt_max_candidates: 48
+
+    # NDT 后的有界 ICP 修正；搜索和新扫描确认共享同一实现。
+    icp_max_iterations: 20
+    icp_correspondence_distance: 0.45
+    icp_max_translation: 0.50
+    icp_max_rotation_deg: 10.0
 
     # 当前单楼层地图地面模型 z = a*x + b*y + c。
     # 雷达高度/地图/安装改变时须重新标定；不是任意楼层通用参数。

@@ -218,4 +218,98 @@ TEST(GlobalMatcher, GroundPlaneHeightAndGravityLevelAreRespected)
     expected.block<3, 1>(0, 3)).norm(), 0.2);
   EXPECT_TRUE(matcher.evaluate(independentScan(level_T_scan), expected).acceptable);
 }
+
+TEST(GlobalMatcher, LocalPolishRemovesSubVoxelBiasAndUsesNewScanGeometry)
+{
+  GlobalMatcher matcher(room(), settings());
+  const auto expected = pose(2.1f, -1.2f, 137.0f * kPi / 180.0f);
+  const auto scan = independentScan(expected);
+  auto biased = expected;
+  biased(0, 3) += .24f;
+  biased(1, 3) -= .15f;
+  const auto before = matcher.evaluate(scan, biased);
+  const auto refined = matcher.polish(scan, biased);
+  ASSERT_TRUE(refined.applied);
+  EXPECT_TRUE(refined.converged);
+  EXPECT_TRUE(std::isfinite(refined.fitness));
+  EXPECT_LT((refined.map_T_scan.block<2, 1>(0, 3) - expected.block<2, 1>(0, 3)).norm(), .07);
+  EXPECT_GT(matcher.evaluate(scan, refined.map_T_scan).score, before.score);
+  EXPECT_TRUE(matcher.evaluate(independentScan(expected, .73f), refined.map_T_scan).acceptable);
+}
+
+TEST(GlobalMatcher, LocalPolishNeverAppliesOverLimitOrCancelledPartialPose)
+{
+  auto options = settings();
+  options.icp_max_translation = .01;
+  GlobalMatcher bounded(room(), options);
+  const auto expected = pose(2.1f, -1.2f, 1.7f);
+  const auto scan = independentScan(expected);
+  auto biased = expected;
+  biased(0, 3) += .24f;
+  const auto over_limit = bounded.polish(scan, biased);
+  EXPECT_FALSE(over_limit.applied);
+  EXPECT_TRUE(over_limit.map_T_scan.isApprox(biased));
+  GlobalMatcher cancellable(room(), settings());
+  int checks = 0;
+  const auto stopped = cancellable.polish(scan, biased, [&checks]() {return ++checks >= 3;});
+  EXPECT_GE(checks, 3);
+  EXPECT_FALSE(stopped.applied);
+  EXPECT_TRUE(stopped.map_T_scan.isApprox(biased));
+  EXPECT_FALSE(cancellable.polish(GlobalCloud::Ptr(new GlobalCloud), biased).applied);
+}
+
+TEST(GlobalMatcher, AdaptiveRefinementRejectsProjectedAliasesUsingIndependent3DGeometry)
+{
+  auto map = room();
+  auto low_structure_alias = room();
+  for (auto & point : *low_structure_alias) {
+    point.x += 14.f;
+    // Same XY wall footprint, different vertical geometry: a projected grid
+    // can score this highly, but a full-height independent scan cannot fit it.
+    point.z *= .05f;
+  }
+  *map += *low_structure_alias;
+  for (auto & point : *low_structure_alias) {point.x -= 28.f;}
+  *map += *low_structure_alias;
+  auto options = settings();
+  options.min_x = -20;
+  options.max_x = 20;
+  options.ndt_candidates = 2;
+  options.ndt_max_candidates = 40;
+  options.unresolved_score_gap = .20;
+  GlobalMatcher matcher(map, options);
+  const auto expected = pose(2.1f, -1.2f, -1.07f);
+  const auto result = matcher.search(independentScan(expected));
+  ASSERT_EQ(result.status, GlobalMatchStatus::SUCCESS) << result.reason;
+  EXPECT_GT(result.refined_modes, 2u);
+  EXPECT_GT(result.geometry_rejected_modes, 0u);
+  EXPECT_EQ(result.unrefined_modes, 0u);
+  EXPECT_LT((result.candidates.front().map_T_scan.block<2, 1>(0, 3) -
+    expected.block<2, 1>(0, 3)).norm(), .2);
+  options.ndt_max_candidates = 2;
+  GlobalMatcher budget_limited(map, options);
+  const auto unresolved = budget_limited.search(independentScan(expected));
+  EXPECT_EQ(unresolved.status, GlobalMatchStatus::AMBIGUOUS) << unresolved.reason;
+  EXPECT_GT(unresolved.unrefined_modes, 0u);
+  EXPECT_EQ(unresolved.refined_modes, 2u);
+  EXPECT_NE(unresolved.reason.find("refinement_budget"), std::string::npos);
+}
+
+TEST(GlobalMatcher, AdaptiveBudgetAndPolishOptionsAreValidated)
+{
+  auto options = settings();
+  options.ndt_max_candidates = options.ndt_candidates - 1;
+  EXPECT_THROW(GlobalMatcher(room(), options), std::invalid_argument);
+  options = settings();
+  options.retained_modes = 2;
+  options.ndt_candidates = 2;
+  // Default maximum > retained modes is capped, not an invalid setting.
+  EXPECT_NO_THROW(GlobalMatcher(room(), options));
+  options = settings();
+  options.icp_max_iterations = 0;
+  EXPECT_THROW(GlobalMatcher(room(), options), std::invalid_argument);
+  options = settings();
+  options.icp_correspondence_distance = 0;
+  EXPECT_THROW(GlobalMatcher(room(), options), std::invalid_argument);
+}
 }  // namespace

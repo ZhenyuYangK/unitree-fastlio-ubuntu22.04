@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -11,6 +13,7 @@
 #include <pcl/common/transforms.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/registration/icp.h>
 #include <pcl/registration/ndt.h>
 
 namespace g1_relocalization
@@ -128,9 +131,12 @@ struct GlobalMatcher::Impl
       !positive(options.max_fitness) || !positive(options.mode_distance) ||
       !positive(options.mode_yaw_deg) || !positive(options.max_refinement_translation) ||
       !positive(options.max_refinement_yaw_deg) || !positive(options.max_refinement_tilt_deg) ||
+      !positive(options.icp_correspondence_distance) || !positive(options.icp_max_translation) ||
+      !positive(options.icp_max_rotation_deg) || options.icp_max_iterations < 1 ||
       options.coarse_sample_count < 10 || options.fine_sample_count < 10 ||
       options.retained_modes < 2 || options.ndt_candidates < 2 ||
-      options.ndt_candidates > options.retained_modes || options.min_scan_points < 10 ||
+      options.ndt_candidates > options.retained_modes ||
+      options.ndt_max_candidates < options.ndt_candidates || options.min_scan_points < 10 ||
       options.ndt_max_iterations < 1 || options.max_grid_cells < 100 ||
       options.max_search_evaluations < 100 ||
       !std::isfinite(options.min_scan_z) || !std::isfinite(options.max_scan_z) ||
@@ -373,6 +379,64 @@ struct GlobalMatcher::Impl
     return result;
   }
 
+  PosePolishResult polishFiltered(
+    GlobalCloud::ConstPtr scan, const Eigen::Matrix4f & initial,
+    const std::function<bool()> & cancelled) const
+  {
+    PosePolishResult result;
+    result.map_T_scan = initial;
+    if (!initial.allFinite() || scan->size() < static_cast<std::size_t>(options.min_scan_points)) {
+      return result;
+    }
+    if (cancelled && cancelled()) {return result;}
+    const auto initial_quality = evaluateFiltered(*scan, initial);
+    pcl::IterativeClosestPoint<GlobalPoint, GlobalPoint> icp;
+    icp.setInputSource(scan);
+    icp.setInputTarget(map);
+    icp.setMaxCorrespondenceDistance(options.icp_correspondence_distance);
+    // PCL ICP does not invoke its visualization callback between iterations.
+    // Explicit single-iteration steps keep cancellation/time budgets effective.
+    icp.setMaximumIterations(1);
+    icp.setTransformationEpsilon(1e-6);
+    icp.setEuclideanFitnessEpsilon(1e-7);
+    Eigen::Matrix4f current = initial;
+    for (int iteration = 0; iteration < options.icp_max_iterations; ++iteration) {
+      if (cancelled && cancelled()) {return result;}
+      GlobalCloud aligned;
+      icp.align(aligned, current);
+      if (cancelled && cancelled()) {return result;}
+      if (!icp.hasConverged()) {return result;}
+      const Eigen::Matrix4f next = icp.getFinalTransformation();
+      if (!next.allFinite()) {return result;}
+      const Eigen::Matrix3f relative = initial.block<3, 3>(0, 0).transpose() *
+        next.block<3, 3>(0, 0);
+      if ((next.block<3, 1>(0, 3) - initial.block<3, 1>(0, 3)).norm() >
+        options.icp_max_translation || Eigen::AngleAxisf(relative).angle() >
+        radians(options.icp_max_rotation_deg))
+      {
+        return result;
+      }
+      const double translation_step =
+        (next.block<3, 1>(0, 3) - current.block<3, 1>(0, 3)).squaredNorm();
+      const double rotation_step = Eigen::AngleAxisf(
+        current.block<3, 3>(0, 0).transpose() * next.block<3, 3>(0, 0)).angle();
+      current = next;
+      if (translation_step <= 1e-6 && rotation_step <= 1e-3) {break;}
+    }
+    if (cancelled && cancelled()) {return result;}
+    result.converged = true;
+    const auto final_quality = evaluateFiltered(*scan, current);
+    const double fitness = icp.getFitnessScore();
+    if (std::isfinite(fitness) && final_quality.score >= initial_quality.score &&
+      (!initial_quality.acceptable || final_quality.acceptable))
+    {
+      result.map_T_scan = current;
+      result.fitness = fitness;
+      result.applied = true;
+    }
+    return result;
+  }
+
   bool sameMode(const Eigen::Matrix4f & a, const Eigen::Matrix4f & b) const
   {
     const Eigen::Matrix3f relative = a.block<3, 3>(0, 0).transpose() * b.block<3, 3>(0, 0);
@@ -389,6 +453,13 @@ const GlobalMatcherOptions & GlobalMatcher::options() const {return impl_->optio
 MatchQuality GlobalMatcher::evaluate(GlobalCloud::ConstPtr scan, const Eigen::Matrix4f & pose) const
 {
   return impl_->evaluateFiltered(*impl_->filterScan(scan), pose);
+}
+
+PosePolishResult GlobalMatcher::polish(
+  GlobalCloud::ConstPtr scan, const Eigen::Matrix4f & pose,
+  const std::function<bool()> & cancelled) const
+{
+  return impl_->polishFiltered(impl_->filterScan(scan), pose, cancelled);
 }
 
 GlobalMatchResult GlobalMatcher::search(
@@ -482,69 +553,164 @@ GlobalMatchResult GlobalMatcher::search(
         check();
       };
     ndt.registerVisualizationCallback(ndt_progress);
-    const std::size_t refine_count = std::min<std::size_t>(options.ndt_candidates, modes.size());
-    for (std::size_t i = 0; i < refine_count; ++i) {
-      check();
-      GlobalMatchCandidate candidate;
-      candidate.correlative_score = modes[i].score;
-      const Eigen::Matrix4f initial = impl_->transform(modes[i]);
-      candidate.map_T_scan = initial;
-      candidate.initial_map_T_scan = initial;
-      if (modes[i].score >= options.min_correlative_score) {
+    result.retained_modes = modes.size();
+    const std::size_t initial_count = std::min<std::size_t>(options.ndt_candidates, modes.size());
+    const std::size_t refinement_limit = std::min<std::size_t>(
+      options.ndt_max_candidates, modes.size());
+    std::vector<bool> refined(modes.size(), false);
+    const auto higherQuality = [](const GlobalMatchCandidate & a, const GlobalMatchCandidate & b) {
+        if (a.acceptable != b.acceptable) {return a.acceptable;}
+        if (a.quality.score != b.quality.score) {return a.quality.score > b.quality.score;}
+        return a.correlative_score > b.correlative_score;
+      };
+    auto bestCandidate = [&]() -> const GlobalMatchCandidate * {
+        const GlobalMatchCandidate * best = nullptr;
+        for (const auto & candidate : result.candidates) {
+          if (candidate.acceptable && (!best || higherQuality(candidate, *best))) {
+            best = &candidate;
+          }
+        }
+        return best;
+      };
+    auto refine = [&](std::size_t i) {
+        check();
+        GlobalMatchCandidate candidate;
+        candidate.correlative_score = modes[i].score;
+        const Eigen::Matrix4f initial = impl_->transform(modes[i]);
+        candidate.map_T_scan = initial;
+        candidate.initial_map_T_scan = initial;
+        candidate.initial_quality = impl_->evaluateFiltered(*scan, initial);
         GlobalCloud aligned;
         ndt.align(aligned, initial);
         check();
         candidate.converged = ndt.hasConverged();
         candidate.map_T_scan = ndt.getFinalTransformation();
         candidate.fitness = ndt.getFitnessScore();
+        if (candidate.converged && candidate.map_T_scan.allFinite()) {
+          const auto polished = impl_->polishFiltered(scan, candidate.map_T_scan, [&]() {
+              check(); return false;
+            });
+          if (polished.applied) {
+            candidate.map_T_scan = polished.map_T_scan;
+            candidate.fitness = polished.fitness;
+          }
+        }
         candidate.quality = impl_->evaluateFiltered(*scan, candidate.map_T_scan);
         const Eigen::Matrix3f relative = initial.block<3, 3>(0, 0).transpose() *
           candidate.map_T_scan.block<3, 3>(0, 0);
         const double yaw_shift = std::abs(std::atan2(relative(1, 0), relative(0, 0)));
         const double tilt_shift = std::acos(std::max(-1.0f, std::min(1.0f, relative(2, 2))));
-        candidate.acceptable = candidate.converged && candidate.map_T_scan.allFinite() &&
-          std::isfinite(candidate.fitness) && candidate.fitness <= options.max_fitness &&
-          candidate.quality.acceptable &&
+        const bool bounded = candidate.map_T_scan.allFinite() &&
           (candidate.map_T_scan.block<3, 1>(0, 3) - initial.block<3, 1>(0, 3)).norm() <=
           options.max_refinement_translation && yaw_shift <= radians(options.max_refinement_yaw_deg) &&
           tilt_shift <= radians(options.max_refinement_tilt_deg);
+        candidate.acceptable = candidate.converged && bounded &&
+          std::isfinite(candidate.fitness) && candidate.fitness <= options.max_fitness &&
+          candidate.quality.acceptable;
+        // A low projected-grid score is never proof. For a high-scoring false
+        // alias, require an actual bounded, converged 3-D optimization and
+        // geometric rejection at BOTH the initial and refined poses. Preserve
+        // failed optimizers or initially plausible 3-D poses as unresolved.
+        candidate.geometry_rejected = candidate.converged && bounded &&
+          !candidate.initial_quality.acceptable && !candidate.quality.acceptable;
+        result.candidates.push_back(candidate);
+        refined[i] = true;
+        ++result.refined_modes;
+      };
+    for (std::size_t i = 0; i < initial_count; ++i) {
+      if (modes[i].score >= options.min_correlative_score) {refine(i);}
+    }
+    // Revisit the remaining modes whenever a new best fit appears. A mode
+    // skipped as the old best's neighbour may be distinct from the new best.
+    // Likewise a lower correlative score of the new best can reveal additional
+    // plausible alternatives. Every retained mode remains in the final audit.
+    while (result.refined_modes < refinement_limit) {
+      check();
+      const auto * best = bestCandidate();
+      std::size_t next = modes.size();
+      for (std::size_t i = 0; i < modes.size(); ++i) {
+        if (refined[i] || modes[i].score < options.min_correlative_score) {continue;}
+        if (best && (modes[i].score < best->correlative_score - options.unresolved_score_gap ||
+          impl_->sameMode(best->map_T_scan, impl_->transform(modes[i]))))
+        {
+          continue;
+        }
+        next = i;
+        break;
       }
-      result.candidates.push_back(candidate);
+      if (next == modes.size()) {break;}
+      refine(next);
     }
     check();
-    std::stable_sort(result.candidates.begin(), result.candidates.end(),
-      [](const GlobalMatchCandidate & a, const GlobalMatchCandidate & b) {
-        if (a.acceptable != b.acceptable) {return a.acceptable;}
-        if (a.quality.score != b.quality.score) {return a.quality.score > b.quality.score;}
-        return a.correlative_score > b.correlative_score;
-      });
+    std::stable_sort(result.candidates.begin(), result.candidates.end(), higherQuality);
+    std::ostringstream details;
+    details << std::fixed << std::setprecision(3);
     if (result.candidates.empty() || !result.candidates.front().acceptable) {
       result.reason = "No NDT candidate passes independent 3-D coverage and refinement limits";
+      for (const auto & candidate : result.candidates) {
+        if (candidate.geometry_rejected) {++result.geometry_rejected_modes;}
+      }
+      for (std::size_t i = 0; i < modes.size(); ++i) {
+        if (!refined[i] && modes[i].score >= options.min_correlative_score) {
+          ++result.unrefined_modes;
+        }
+      }
     } else {
       const auto & best = result.candidates.front();
-      bool ambiguous = false;
       for (std::size_t i = 1; i < result.candidates.size(); ++i) {
         const auto & alternative = result.candidates[i];
         const Eigen::Matrix4f & alternative_pose = alternative.acceptable ?
           alternative.map_T_scan : alternative.initial_map_T_scan;
-        if (impl_->sameMode(best.map_T_scan, alternative_pose)) {continue;}
-        // A plausible geometric mode with a failed optimizer remains unresolved.
+        if (impl_->sameMode(best.map_T_scan, alternative_pose)) {
+          ++result.merged_modes;
+          continue;
+        }
+        if (alternative.geometry_rejected) {
+          ++result.geometry_rejected_modes;
+          continue;
+        }
         const bool unresolved = !alternative.acceptable &&
           alternative.correlative_score >= best.correlative_score - options.unresolved_score_gap;
         const bool competing = alternative.acceptable &&
           best.quality.score - alternative.quality.score < options.ambiguity_score_gap;
-        if (unresolved || competing) {ambiguous = true; break;}
-      }
-      for (std::size_t i = refine_count; i < modes.size(); ++i) {
-        if (modes[i].score >= best.correlative_score - options.unresolved_score_gap) {
-          ambiguous = true;
-          break;
+        if (unresolved) {++result.unresolved_modes;}
+        if (competing) {++result.competing_modes;}
+        if ((unresolved || competing) && details.tellp() == std::streampos(0)) {
+          details << " first_blocker=" << (competing ? "competing" : "optimizer_unresolved")
+                  << " xy=" << alternative_pose(0, 3) << ',' << alternative_pose(1, 3)
+                  << " corr=" << alternative.correlative_score
+                  << " coverage=" << alternative.quality.coverage
+                  << " initial_coverage=" << alternative.initial_quality.coverage;
         }
       }
+      for (std::size_t i = 0; i < modes.size(); ++i) {
+        if (refined[i] || modes[i].score < options.min_correlative_score ||
+          modes[i].score < best.correlative_score - options.unresolved_score_gap)
+        {
+          continue;
+        }
+        if (impl_->sameMode(best.map_T_scan, impl_->transform(modes[i]))) {
+          ++result.merged_modes;
+          continue;
+        }
+        ++result.unrefined_modes;
+        if (details.tellp() == std::streampos(0)) {
+          details << " first_blocker=refinement_budget xy=" << modes[i].x << ',' << modes[i].y
+                  << " corr=" << modes[i].score;
+        }
+      }
+      const bool ambiguous = result.competing_modes || result.unresolved_modes || result.unrefined_modes;
       result.status = ambiguous ? GlobalMatchStatus::AMBIGUOUS : GlobalMatchStatus::SUCCESS;
-      result.reason = ambiguous ? "Competing or unrefined plausible global modes remain" :
+      result.reason = ambiguous ? "Competing or unresolved plausible global modes remain" :
         "Unique global mode passes NDT and independent 3-D coverage; confirm with a new scan";
     }
+    result.reason += "; retained=" + std::to_string(result.retained_modes) +
+      " refined=" + std::to_string(result.refined_modes) +
+      " merged=" + std::to_string(result.merged_modes) +
+      " geometry_rejected=" + std::to_string(result.geometry_rejected_modes) +
+      " competing=" + std::to_string(result.competing_modes) +
+      " optimizer_unresolved=" + std::to_string(result.unresolved_modes) +
+      " unrefined=" + std::to_string(result.unrefined_modes) + details.str();
   } catch (const SearchInterrupted & interrupted) {
     result.status = interrupted.status;
     result.reason = "Global search stopped; incomplete search cannot establish a unique pose";

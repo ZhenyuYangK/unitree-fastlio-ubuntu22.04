@@ -51,6 +51,9 @@ struct GlobalMatcherOptions
   int fine_sample_count = 400;
   int retained_modes = 96;
   int ndt_candidates = 12;
+  // Initial batch size above is not a uniqueness cutoff. Refine additional
+  // plausible, distinct modes until resolved, within this total NDT budget.
+  int ndt_max_candidates = 48;
   double mode_distance = 1.0;
   double mode_yaw_deg = 20.0;
   double min_correlative_score = 0.45;
@@ -72,6 +75,13 @@ struct GlobalMatcherOptions
   double max_refinement_translation = 2.0;
   double max_refinement_yaw_deg = 25.0;
   double max_refinement_tilt_deg = 15.0;
+
+  // NDT voxel distributions can bias a correct fit by tens of centimetres.
+  // Local nearest-point polishing is bounded and may not reduce 3-D support.
+  int icp_max_iterations = 20;
+  double icp_correspondence_distance = 0.45;
+  double icp_max_translation = 0.5;
+  double icp_max_rotation_deg = 10.0;
 };
 
 struct MatchQuality
@@ -90,9 +100,22 @@ struct GlobalMatchCandidate
   Eigen::Matrix4f initial_map_T_scan = Eigen::Matrix4f::Identity();
   double correlative_score = 0.0;
   double fitness = std::numeric_limits<double>::infinity();
+  MatchQuality initial_quality;
   MatchQuality quality;
   bool converged = false;
   bool acceptable = false;
+  // A converged, bounded fit AND its initial pose both failed independent 3-D
+  // geometry. Optimizer failures alone never establish rejection.
+  bool geometry_rejected = false;
+};
+
+struct PosePolishResult
+{
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  Eigen::Matrix4f map_T_scan = Eigen::Matrix4f::Identity();
+  double fitness = std::numeric_limits<double>::infinity();
+  bool converged = false;
+  bool applied = false;
 };
 
 enum class GlobalMatchStatus
@@ -115,6 +138,13 @@ struct GlobalMatchResult
   std::vector<GlobalMatchCandidate, Eigen::aligned_allocator<GlobalMatchCandidate>> candidates;
   double elapsed_seconds = 0.0;
   std::size_t evaluations = 0;
+  std::size_t retained_modes = 0;
+  std::size_t refined_modes = 0;
+  std::size_t merged_modes = 0;
+  std::size_t geometry_rejected_modes = 0;
+  std::size_t competing_modes = 0;
+  std::size_t unresolved_modes = 0;
+  std::size_t unrefined_modes = 0;
 };
 
 class GlobalMatcher
@@ -136,6 +166,12 @@ public:
   // Independent nearest-neighbour 3-D coverage on structural (non-floor) scan
   // points. Suitable for a NEW scan confirmation and subsequent tracking.
   MatchQuality evaluate(GlobalCloud::ConstPtr scan, const Eigen::Matrix4f & map_T_scan) const;
+  // Input axes and transform convention match evaluate(). Cancellation returns
+  // the initial pose without applying any partial optimization. A throwing
+  // cancellation callback is propagated (used internally for search budgets).
+  PosePolishResult polish(
+    GlobalCloud::ConstPtr scan, const Eigen::Matrix4f & map_T_scan,
+    const std::function<bool()> & cancelled = {}) const;
   const GlobalMatcherOptions & options() const;
 
 private:

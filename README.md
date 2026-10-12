@@ -68,7 +68,7 @@ python3 g1_slam_ws/maps/pcd2pgm_multilayer.py --help
 ./g1_slam_ws/script/g1_navigation.sh start-auto
 ```
 
-该入口不需要初始位置、朝向或 `auto_start_pose.env`。机器人保持静止后，系统采集点云，在三维地图中搜索候选位置和朝向，用 NDT 精配准及后续新扫描确认结果。只有 `/g1_relocalization/status` 报告有效且新鲜的 `LOCALIZED` 或 `TRACKING` 状态，脚本才启动 Nav2。默认等待 180 秒，可通过环境变量调整：
+该入口不需要初始位置、朝向或 `auto_start_pose.env`。机器人保持静止后，系统采集点云，在三维地图中搜索候选位置和朝向，用 NDT 精配准、有界 ICP 修正及后续新扫描确认结果。只有 `/g1_relocalization/status` 报告有效且新鲜的 `LOCALIZED` 或 `TRACKING` 状态，脚本才启动 Nav2。默认等待 180 秒，可通过环境变量调整：
 
 ```bash
 G1_LOCALIZATION_TIMEOUT_SEC=240 ./g1_slam_ws/script/g1_navigation.sh start-auto
@@ -128,6 +128,21 @@ python3 -m unittest discover -s g1_slam_ws/script/tests -v
 | 其他位置 | 原版搜索约 0.85 秒后返回 `AMBIGUOUS`；之后人工初始化确认成功，fitness=0.079234，coverage=0.693；自动定位优化后需现场复测 |
 
 以上标志仅确认常用启动点成功，不代表所有位置或完整真实导航已经验收。
+
+2026-10-12 的异地定位优化将固定 12 个精配准候选改为初始 12 个、按歧义需要扩展到最多 48 个；合并同一位置模式，并用完整三维质量排除投影相似的伪候选。NDT 后增加最多 20 次的 ICP 修正，限制移动 0.50 m、转动 10°，原质量和歧义阈值保持不变；新扫描确认使用同一修正方法。仍有可信不同地点或预算不足时继续拒绝初始化。
+
+本轮 55 项自动化测试/场景通过，包括四个不同位置/朝向的独立射线扫描、遮挡、环境变化、重复房间和单墙拒绝。其他实际启动位置的优化效果仍需复测。
+
+现有启动脚本会将每次全局搜索的精确输入 PCD 与候选 JSON 保存到 `g1_slam_ws/runtime/relocalization/`。报告包含候选位姿、覆盖率、误差、参数和具体歧义原因；该目录不进入 Git。若仍失败，请保留这两个文件及 `runtime/navigation/logs/relocalization.log`。保存的 PCD 已在重力参考坐标，无需再次应用 body 姿态旋转：
+
+```bash
+source unitree_ros2/setup.sh
+# 将文件名替换为本轮生成的 PCD；已修改地图/地面参数时同步 CLI 参数。
+ros2 run g1_relocalization global_matcher_check \
+  --map "${G1_MAP_PCD:-$G1_WS/maps/map.pcd}" \
+  --scan "$G1_WS/runtime/relocalization/global_<扫描时间戳>_g0.pcd" \
+  --ndt-candidates 12 --ndt-max-candidates 48 --timeout 180
+```
 
 离线检查当前地图索引，或对独立录制的局部扫描测试匹配：
 

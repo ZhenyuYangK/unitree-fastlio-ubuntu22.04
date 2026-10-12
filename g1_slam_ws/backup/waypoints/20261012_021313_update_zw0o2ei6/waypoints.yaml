@@ -1,0 +1,19 @@
+schema_version: 1
+map_id: laboratory_map_v1
+frame_id: map
+base_frame: nav_base
+waypoints:
+  home:
+    name: 待命点
+    pose:
+      x: 1.237988659628472
+      y: -0.20652756808408135
+      yaw: 0.5189720848124495
+    recorded_at: '2026-10-12T02:03:37-07:00'
+  point_a:
+    name: 测试点A
+    pose:
+      x: 2.3146190517345357
+      y: 0.7013702255911651
+      yaw: 0.6192751556869376
+    recorded_at: '2026-09-20T15:11:43+08:00'

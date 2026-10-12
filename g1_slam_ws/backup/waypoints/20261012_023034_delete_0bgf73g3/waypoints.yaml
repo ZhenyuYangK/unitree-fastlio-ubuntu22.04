@@ -1,0 +1,12 @@
+schema_version: 1
+map_id: laboratory_map_v1
+frame_id: map
+base_frame: nav_base
+waypoints:
+  point_a:
+    name: 测试点A
+    pose:
+      x: 9.948799184309788
+      y: 14.222806372384278
+      yaw: -3.111141861315706
+    recorded_at: '2026-10-12T02:13:13-07:00'

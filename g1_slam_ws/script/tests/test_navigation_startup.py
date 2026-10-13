@@ -5,9 +5,12 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
+
+import yaml
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
@@ -190,6 +193,39 @@ class NavigationStartupTest(unittest.TestCase):
 
     def calls(self):
         return [json.loads(line) for line in self.calls_file.read_text().splitlines()]
+
+    def navigation_velocity_profiles(self):
+        result = self.run_script("start-auto")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        source = self.ws / "src/g1_nav2_bringup/config/nav2_params.yaml"
+        generated = self.root / "generated_nav2.yaml"
+        result = subprocess.run(
+            [sys.executable, str(WORKSPACE / "src/g1_nav2_bringup/tools/generate_nav2_params.py"),
+             str(source), str(generated)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+        planners = {
+            path.name: yaml.safe_load(path.read_text())["controller_server"]["ros__parameters"]["FollowPath"]
+            for path in (source, generated, self.ws / "runtime/navigation/nav2_params_safe.yaml")
+        }
+        bridges = {
+            mode: yaml.safe_load((self.ws / "src/g1_loco_bridge/config" /
+                                  f"g1_loco_bridge_nav2_{mode}.yaml").read_text())
+            ["g1_cmd_vel_dry_run"]["ros__parameters"]
+            for mode in ("real", "dry_run")
+        }
+        return planners, bridges
+
+    def test_navigation_acceleration_limits_agree_across_generated_configs(self):
+        planners, bridges = self.navigation_velocity_profiles()
+        for planner_name, planner in planners.items():
+            for bridge_name, bridge in bridges.items():
+                with self.subTest(planner=planner_name, bridge=bridge_name):
+                    for axis in ("x", "theta"):
+                        kind = "linear" if axis == "x" else "angular"
+                        self.assertEqual(planner[f"acc_lim_{axis}"], bridge[f"max_{kind}_accel"])
+                        self.assertEqual(-planner[f"decel_lim_{axis}"], bridge[f"max_{kind}_decel"])
 
     def nav_launched(self):
         return any(call[:2] == ["launch", "g1_nav2_bringup"] for call in self.calls())

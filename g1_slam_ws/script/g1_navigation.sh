@@ -240,7 +240,7 @@ nav_values = {
     "min_speed_xy": "0.0",
     "max_speed_xy": "0.50",
     "min_speed_theta": "0.40",
-    "acc_lim_x": "0.3",
+    "acc_lim_x": "0.2",
     "acc_lim_y": "0.0",
     "acc_lim_theta": "4.0",
     "decel_lim_x": "-0.3",

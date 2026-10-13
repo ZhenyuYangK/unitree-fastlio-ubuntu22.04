@@ -234,11 +234,11 @@ nav_lines = nav_src.read_text(encoding="utf-8").splitlines()
 nav_values = {
     "min_vel_x": "0.0",
     "min_vel_y": "0.0",
-    "max_vel_x": "0.50",
+    "max_vel_x": "1.0",
     "max_vel_y": "0.0",
     "max_vel_theta": "0.40",
     "min_speed_xy": "0.0",
-    "max_speed_xy": "0.50",
+    "max_speed_xy": "1.0",
     "min_speed_theta": "0.40",
     "acc_lim_x": "0.2",
     "acc_lim_y": "0.0",

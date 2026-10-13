@@ -88,6 +88,12 @@ G1_LOCALIZATION_TIMEOUT_SEC=240 ./g1_slam_ws/script/g1_navigation.sh start-auto
 
 `start-fixed` 是原 `start-auto` 固定坐标模式的新名称。使用它时需自行创建 `auto_start_pose.env`，填写 `AUTO_X`、`AUTO_Y`、`AUTO_YAW`（弧度），可选 `AUTO_Z`（默认 0）。
 
+导航速度配置：最大前进速度 1.0 m/s，左右横移上限各 0.20 m/s，最大转速 0.40 rad/s。
+Nav2 的平面合速度上限为 1.0 m/s；同时前进和横移时受该上限约束。
+Nav2 和导航真机/Dry Run 桥的线速度加速上限均为 0.20 m/s²、减速幅值为 0.30 m/s²，
+角速度加减速幅值均为 4.0 rad/s²。导航桥允许左右横移，禁止倒退。
+参数修改后需重启 Nav2 和导航桥加载；`g1_navigation.sh` 会重新生成运行时参数文件。
+
 连接真机速度桥：
 
 ```bash

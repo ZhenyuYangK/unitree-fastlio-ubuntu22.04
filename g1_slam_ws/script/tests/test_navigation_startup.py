@@ -239,6 +239,21 @@ class NavigationStartupTest(unittest.TestCase):
                         self.assertGreater(bridge[f"reject_abs_{kind}_{axis}"],
                                            bridge[f"max_{kind}_{axis}"])
 
+    def test_navigation_samples_both_lateral_directions_with_matching_bridge_limits(self):
+        planners, bridges = self.navigation_velocity_profiles()
+        for planner_name, planner in planners.items():
+            for bridge_name, bridge in bridges.items():
+                with self.subTest(planner=planner_name, bridge=bridge_name):
+                    self.assertTrue(bridge["allow_lateral"])
+                    self.assertFalse(bridge["allow_reverse"])
+                    self.assertGreater(planner["max_vel_y"], 0.0)
+                    self.assertEqual(planner["max_vel_y"], bridge["max_linear_y"])
+                    self.assertEqual(planner["min_vel_y"], -bridge["max_linear_y"])
+                    self.assertGreaterEqual(planner["vy_samples"], 3)
+                    self.assertEqual(planner["vy_samples"] % 2, 1)
+                    self.assertEqual(planner["acc_lim_y"], bridge["max_linear_accel"])
+                    self.assertEqual(-planner["decel_lim_y"], bridge["max_linear_decel"])
+
     def nav_launched(self):
         return any(call[:2] == ["launch", "g1_nav2_bringup"] for call in self.calls())
 

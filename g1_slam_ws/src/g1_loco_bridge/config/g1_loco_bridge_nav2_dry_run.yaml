@@ -8,14 +8,14 @@ g1_cmd_vel_dry_run:
     localization_status_timeout_sec: 1.0
     localization_success_timeout_sec: 3.0
     allow_reverse: false
-    allow_lateral: false
+    allow_lateral: true
     unitree_command_duration_sec: 0.3
     unitree_resend_period_sec: 0.1
     command_timeout_sec: 0.5
     control_period_sec: 0.05
     report_period_sec: 2.0
     max_linear_x: 1.0
-    max_linear_y: 0.05
+    max_linear_y: 0.20
     max_angular_z: 0.40
     reject_abs_linear_x: 1.6
     reject_abs_linear_y: 0.5

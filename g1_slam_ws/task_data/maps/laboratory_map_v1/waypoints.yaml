@@ -1,5 +1,0 @@
-schema_version: 1
-map_id: laboratory_map_v1
-frame_id: map
-base_frame: nav_base
-waypoints: {}

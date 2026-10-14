@@ -5,6 +5,10 @@
 /g1_slam_ws/install/
 /g1_slam_ws/log/
 /g1_slam_ws/runtime/
+/g1_slam_ws/maps/**
+!/g1_slam_ws/maps/pcd2pgm_multilayer.py
+/g1_slam_ws/task_data/maps/laboratory_map_v1/waypoints.yaml
+/g1_slam_ws/task_data/missions/missions.yaml
 **/__pycache__/
 *.pyc
 *.g1_waypoints.lock

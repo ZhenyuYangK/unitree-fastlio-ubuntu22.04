@@ -10,7 +10,7 @@ fi
 g1_source_environment
 printf '[OK] 系统: %s / ROS 2 %s / %s / domain %s\n' "$(uname -m)" "${ROS_DISTRO}" "${RMW_IMPLEMENTATION}" "${ROS_DOMAIN_ID}"
 for package in livox_sdk2 livox_ros_driver2 fast_lio g1_relocalization g1_nav2_bringup \
-  g1_loco_bridge g1_unitree_ros2_probe g1_task_interfaces g1_task_manager unitree_api \
+  g1_loco_bridge g1_audio_bridge g1_unitree_ros2_probe g1_task_interfaces g1_task_manager unitree_api \
   nav2_behaviors nav2_map_server nav2_controller nav2_planner nav2_bt_navigator rviz2 rmw_cyclonedds_cpp; do
   if [[ "$package" == livox_sdk2 ]]; then
     [[ -f "${G1_WS}/install/livox_sdk2/lib/liblivox_lidar_sdk_shared.so" ]] || { g1_error '缺少本机 Livox SDK'; exit 1; }
@@ -18,7 +18,7 @@ for package in livox_sdk2 livox_ros_driver2 fast_lio g1_relocalization g1_nav2_b
     ros2 pkg prefix "$package" >/dev/null || { g1_error "缺少包: ${package}"; exit 1; }
   fi
 done
-python3 -c 'import rclpy, yaml, numpy, scipy; from unitree_api.msg import Request; from livox_ros_driver2.msg import CustomMsg; from g1_task_interfaces.action import ExecuteMission; print("[OK] ROS/Python 消息和依赖")'
+python3 -c 'import rclpy, yaml, numpy, scipy; from unitree_api.msg import Request; from livox_ros_driver2.msg import CustomMsg; from g1_task_interfaces.action import ExecuteMission, Speak; from g1_task_interfaces.srv import GetMissionState, ContinueMission; print("[OK] ROS/Python 消息和依赖")'
 python3 - "${G1_WS}" <<'PY'
 import sys
 from pathlib import Path

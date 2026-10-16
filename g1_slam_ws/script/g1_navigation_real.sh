@@ -11,11 +11,114 @@ RUNTIME="$WS/runtime/navigation"
 LOG_DIR="$RUNTIME/logs"
 PID_FILE="$RUNTIME/real_bridge.pid"
 LOG_FILE="$LOG_DIR/real_bridge.log"
+AUDIO_PID_FILE="$RUNTIME/audio_bridge.pid"
+AUDIO_LOG_FILE="$LOG_DIR/audio_bridge.log"
 LOCALIZATION_HELPER="${SCRIPT_DIR}/g1_wait_localization.py"
 
 mkdir -p "$LOG_DIR"
 
 load_env() { g1_source_environment; }
+
+# A PID can be reused after an interrupted session. Match its kernel start time
+# before sending any signal to a process recorded as ours.
+process_token()
+{
+    python3 - "$1" <<'PY'
+import pathlib
+import sys
+try:
+    fields = pathlib.Path('/proc/' + sys.argv[1] + '/stat').read_text().rsplit(')', 1)[1].split()
+    if fields[0] == 'Z':
+        raise SystemExit(1)
+    print(fields[19])
+except (OSError, IndexError):
+    raise SystemExit(1)
+PY
+}
+
+stop_audio_bridge()
+{
+    [[ -f "$AUDIO_PID_FILE" ]] || return 0
+    local audio_pid token current attempt
+    read -r audio_pid token < "$AUDIO_PID_FILE" || true
+    [[ "${audio_pid:-}" =~ ^[1-9][0-9]*$ && "${token:-}" =~ ^[0-9]+$ ]] || {
+        echo "[ERROR] 语音 PID 记录无效，未发送停止信号：$AUDIO_PID_FILE"
+        return 1
+    }
+    current="$(process_token "$audio_pid" || true)"
+    if [[ "$current" != "$token" ]]; then
+        rm -f "$AUDIO_PID_FILE"
+        echo "[INFO] 已清除退出的语音进程记录"
+        return 0
+    fi
+    kill -INT -- "-$audio_pid" 2>/dev/null || kill -INT "$audio_pid" 2>/dev/null || true
+    for attempt in {1..30}; do
+        current="$(process_token "$audio_pid" || true)"
+        if [[ "$current" != "$token" ]]; then
+            rm -f "$AUDIO_PID_FILE"
+            echo "[OK] 导航启动的语音桥已停止"
+            return 0
+        fi
+        sleep 0.2
+    done
+    # Keep the record so a later stop can retry; never report a live process as stopped.
+    echo "[ERROR] 语音桥停止尚未确认，请检查 $AUDIO_LOG_FILE；PID 记录已保留"
+    return 1
+}
+
+start_audio_bridge()
+{
+    local result prefix executable volume audio_pid token
+    volume="${G1_AUDIO_VOLUME:--1}"
+    [[ "$volume" =~ ^(-1|0|[1-9][0-9]?|100)$ ]] || {
+        echo "[ERROR] G1_AUDIO_VOLUME 必须为 -1（保留当前音量）或 0..100"
+        return 1
+    }
+    # Do not spawn another server when an existing one is still starting or
+    # misconfigured. Exit 3 means no bridge/action was discovered at all.
+    if python3 -m g1_task_manager.audio_readiness --timeout 2 --probe; then
+        echo "[OK] 复用已运行的真实语音桥"
+        return 0
+    else
+        result=$?
+        [[ "$result" == 3 ]] || return "$result"
+    fi
+    if [[ -f "$AUDIO_PID_FILE" ]]; then
+        read -r audio_pid token < "$AUDIO_PID_FILE" || true
+        if [[ "${audio_pid:-}" =~ ^[1-9][0-9]*$ && -n "${token:-}"
+              && "$(process_token "$audio_pid" || true)" == "$token" ]]; then
+            echo "[ERROR] 已有导航语音进程，但 ROS 服务不可见；请检查网络/Domain 或先执行 stop"
+            return 1
+        fi
+        rm -f "$AUDIO_PID_FILE"
+    fi
+    prefix="$(ros2 pkg prefix g1_audio_bridge)" || return 1
+    executable="$prefix/lib/g1_audio_bridge/g1_audio_bridge"
+    [[ -x "$executable" ]] || {
+        echo "[ERROR] 找不到语音桥可执行文件，请重新构建：$executable"
+        return 1
+    }
+    # Run the binary directly so its PID is the managed process, with no ros2
+    # launcher intermediary. Close the lifecycle lock in the child.
+    setsid "$executable" --ros-args -p dry_run:=false -p "volume:=$volume" \
+        >"$AUDIO_LOG_FILE" 2>&1 </dev/null 9>&- &
+    audio_pid=$!
+    token="$(process_token "$audio_pid" || true)"
+    if [[ -z "$token" ]]; then
+        echo "[ERROR] 语音桥启动后立即退出"
+        tail -n 80 "$AUDIO_LOG_FILE"
+        return 1
+    fi
+    printf '%s %s\n' "$audio_pid" "$token" > "$AUDIO_PID_FILE"
+    if python3 -m g1_task_manager.audio_readiness --timeout 10; then
+        echo "[OK] 真实语音桥已启动，日志：$AUDIO_LOG_FILE"
+        return 0
+    fi
+    echo "[ERROR] 语音桥未就绪，停止本次创建的语音进程"
+    tail -n 80 "$AUDIO_LOG_FILE"
+    stop_audio_bridge || true
+    return 1
+}
 
 check_localization()
 {
@@ -81,6 +184,7 @@ start_bridge()
     then
         check_real_bridge || exit 1
         echo "[WARN] 真机安全桥已经运行"
+        start_audio_bridge
         return
     fi
 
@@ -98,12 +202,14 @@ start_bridge()
     echo "=========================================="
     echo
 
+    start_audio_bridge || return $?
+
     setsid ros2 run \
         g1_loco_bridge \
         g1_cmd_vel_dry_run \
         --ros-args \
         --params-file "$CFG" \
-        >"$LOG_FILE" 2>&1 </dev/null &
+        >"$LOG_FILE" 2>&1 </dev/null 9>&- &
 
     pid=$!
     echo "$pid" > "$PID_FILE"
@@ -114,6 +220,7 @@ start_bridge()
         grep -Fx /g1_cmd_vel_dry_run >/dev/null || {
             echo "[ERROR] real bridge 启动失败"
             tail -n 80 "$LOG_FILE"
+            stop_bridge
             exit 1
         }
 
@@ -172,6 +279,7 @@ stop_bridge()
     fi
 
     echo "[OK] 真机安全桥已停止"
+    stop_audio_bridge
 }
 
 status()
@@ -211,16 +319,32 @@ status()
     else
         echo "未运行"
     fi
+
+    echo
+    echo "===== Audio bridge ====="
+    python3 -m g1_task_manager.audio_readiness --timeout 3 || true
+    if [[ -f "$AUDIO_PID_FILE" ]]; then
+        echo "管理方式：由导航启动，stop 将清理该进程"
+    else
+        echo "管理方式：外部实例由原启动者停止"
+    fi
+    echo "语音日志：$AUDIO_LOG_FILE"
 }
 
 logs()
 {
-    tail -n 150 "$LOG_FILE"
+    local file
+    for file in "$LOG_FILE" "$AUDIO_LOG_FILE"; do
+        echo "===== $file ====="
+        if [[ -f "$file" ]]; then tail -n 100 "$file"; else echo "暂无日志"; fi
+    done
 }
 
 case "${1:-}" in
 
     start)
+        exec 9>"$RUNTIME/real_lifecycle.lock"
+        flock -n 9 || { echo "[ERROR] 另一个真机 start/stop 正在执行"; exit 1; }
         start_bridge
         ;;
 
@@ -233,6 +357,8 @@ case "${1:-}" in
         ;;
 
     stop)
+        exec 9>"$RUNTIME/real_lifecycle.lock"
+        flock -n 9 || { echo "[ERROR] 另一个真机 start/stop 正在执行"; exit 1; }
         stop_bridge
         ;;
 

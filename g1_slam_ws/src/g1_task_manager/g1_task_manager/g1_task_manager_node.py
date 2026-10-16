@@ -136,7 +136,8 @@ class G1TaskManagerNode(Node):
     def execute(self, goal_handle):
         mission = goal_handle.request.mission_id
         progress = dict(state='STARTING', current_waypoint='', current_step=0,
-                        total_steps=0, distance_remaining=-1.0, message='')
+                        total_steps=0, distance_remaining=-1.0, message='', run_id='',
+                        wait_id='', next_waypoint='', simulated=False)
 
         class Cancellation:
             def is_set(inner):
@@ -153,11 +154,14 @@ class G1TaskManagerNode(Node):
             # A disconnected feedback subscriber must not abandon the worker.
             try:
                 goal_handle.publish_feedback(ExecuteMission.Feedback(**progress))
-                self.publish_status(progress['state'], mission,
+                self.publish_status(progress['state'], mission, progress['message'],
                                     current_step=progress['current_step'],
                                     total_steps=progress['total_steps'],
                                     current_waypoint=progress['current_waypoint'],
-                                    distance_remaining=progress['distance_remaining'])
+                                    distance_remaining=progress['distance_remaining'],
+                                    run_id=progress['run_id'], wait_id=progress['wait_id'],
+                                    next_waypoint=progress['next_waypoint'],
+                                    simulated=progress['simulated'])
             except Exception as exc:
                 self.get_logger().warning('Feedback publish failed: ' + str(exc))
 

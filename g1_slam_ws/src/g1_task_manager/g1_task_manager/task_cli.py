@@ -51,6 +51,8 @@ def build_parser():
     )
 
     add_parsers(subparsers)
+    from .mission_control_cli import add_parsers as add_control_parsers
+    add_control_parsers(subparsers)
     return parser
 
 
@@ -85,6 +87,9 @@ def main(args=None):
     parsed = parser.parse_args(args=args)
 
     try:
+        if parsed.command in ('status', 'continue'):
+            from .mission_control_cli import run_command as control_command
+            return control_command(parsed)
         if parsed.command == "goto" and (
             not math.isfinite(parsed.timeout) or parsed.timeout <= 0.0
         ):

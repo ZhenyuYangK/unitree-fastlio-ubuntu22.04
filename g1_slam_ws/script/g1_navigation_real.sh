@@ -69,7 +69,7 @@ stop_audio_bridge()
 start_audio_bridge()
 {
     local result prefix executable volume audio_pid token
-    volume="${G1_AUDIO_VOLUME:--1}"
+    volume="${G1_AUDIO_VOLUME:-100}"
     [[ "$volume" =~ ^(-1|0|[1-9][0-9]?|100)$ ]] || {
         echo "[ERROR] G1_AUDIO_VOLUME 必须为 -1（保留当前音量）或 0..100"
         return 1

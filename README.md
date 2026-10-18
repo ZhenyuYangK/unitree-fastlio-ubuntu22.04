@@ -72,13 +72,13 @@ python3 g1_slam_ws/maps/pcd2pgm_multilayer.py --help
 ./g1_slam_ws/script/g1_navigation.sh start-auto
 ```
 
-该入口不需要初始位置、朝向或 `auto_start_pose.env`。机器人保持静止后，系统采集点云，在三维地图中搜索候选位置和朝向，用 NDT 精配准及后续新扫描确认结果。只有 `/g1_relocalization/status` 报告有效且新鲜的 `LOCALIZED` 或 `TRACKING` 状态，脚本才启动 Nav2。默认等待 180 秒，可通过环境变量调整：
+该入口不需要初始位置、朝向或 `auto_start_pose.env`。机器人保持静止后，系统采集点云，在三维地图中搜索候选位置和朝向，用 NDT 精配准及后续新扫描确认结果。歧义候选按匹配质量排序，默认保留最多 3 个位置，用同一批后续扫描比较；综合分和覆盖率无法可靠区分时重新采集，默认最多 3 轮。只有 `/g1_relocalization/status` 报告有效且新鲜的 `LOCALIZED` 或 `TRACKING` 状态，脚本才启动 Nav2。默认自动初始化总预算为 180 秒（从第一帧同步数据起，覆盖采集、搜索、验证及重试，不含整个导航栈的启动耗时），可通过环境变量调整：
 
 ```bash
 G1_LOCALIZATION_TIMEOUT_SEC=240 ./g1_slam_ws/script/g1_navigation.sh start-auto
 ```
 
-搜索失败、匹配存在歧义或等待超时，脚本返回非零，保留雷达、FAST-LIO、重定位和地图节点，方便检查及人工后备。可在 RViz 点击 **2D Pose Estimate** 指定实际位置和朝向；定位状态有效后运行 `./g1_slam_ws/script/g1_navigation.sh continue`。重复走廊或相似房间可能需要人工后备。
+重试或总预算耗尽后仍匹配失败/有歧义，脚本返回非零，保留雷达、FAST-LIO、重定位和地图节点，方便检查及人工后备。可在 RViz 点击 **2D Pose Estimate** 指定实际位置和朝向；定位状态有效后运行 `./g1_slam_ws/script/g1_navigation.sh continue`。重复走廊或相似房间可能需要人工后备。每轮搜索输入 PCD、候选评分、验证过程及地图/配置哈希保存到 `g1_slam_ws/runtime/navigation/diagnostics/relocalization/`。
 
 保留以下入口：
 

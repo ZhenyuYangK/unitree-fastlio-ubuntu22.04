@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 CONSOLE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export G1_WEB_MODE="${G1_WEB_MODE:-local}"
-if [[ "${G1_WEB_MODE}" == ros_readonly ]]; then
+if [[ "${G1_WEB_MODE}" == ros_readonly || "${G1_WEB_MODE}" == ros_control ]]; then
   source "${CONSOLE_DIR}/../g1_slam_ws/script/g1_env.sh"
   g1_source_environment
 fi

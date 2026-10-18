@@ -31,6 +31,12 @@ class RobotAdapter:
     async def cancel_mission(self, run_id):
         self.unsupported()
 
+    async def go_to(self, waypoint_id):
+        self.unsupported()
+
+    async def initial_pose(self, x, y, yaw):
+        self.unsupported()
+
     @staticmethod
     def unsupported():
         raise GatewayError(501, "NOT_IMPLEMENTED", "此接口尚未接入真机；当前 ROS 适配器只读")

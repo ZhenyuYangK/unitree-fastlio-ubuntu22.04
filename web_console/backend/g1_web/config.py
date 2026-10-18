@@ -20,13 +20,13 @@ class Settings:
     map_pgm: str = ""
 
     def __post_init__(self):
-        if self.mode not in {"local", "mock", "ros_readonly"}:
-            raise ValueError("G1_WEB_MODE 只支持 local / mock / ros_readonly；不提供真机运动控制")
+        if self.mode not in {"local", "mock", "ros_readonly", "ros_control"}:
+            raise ValueError("G1_WEB_MODE 只支持 local / mock / ros_readonly / ros_control")
         if not 1 <= self.port <= 65535:
             raise ValueError("端口必须在 1..65535 之间")
         if self.lease_seconds <= 0 or self.mock_travel_seconds <= 0 or self.mock_speech_seconds <= 0:
             raise ValueError("租约和模拟阶段时长必须为正数")
-        if (self.mode == "ros_readonly" or self.host not in {"127.0.0.1", "localhost", "::1"}) and not self.token:
+        if (self.mode in {"ros_readonly", "ros_control"} or self.host not in {"127.0.0.1", "localhost", "::1"}) and not self.token:
             raise ValueError("局域网访问及 ROS 只读模式需要设置 G1_WEB_TOKEN")
 
     @classmethod

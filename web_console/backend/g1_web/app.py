@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, UUID4
 
@@ -21,6 +21,10 @@ from .adapters.local import LocalAdapter
 from .config import Settings
 from .control import CommandCache, ControlLease, GatewayError
 from .workspace import WorkspaceData
+from .mapping import MappingManager
+from .navigation import NavigationManager
+from .journal import CommandJournal
+from .adapters.ros_control import RosControlAdapter
 
 
 class Payload(BaseModel):
@@ -41,6 +45,7 @@ class Command(Payload):
 
 class MissionStart(Command):
     mission_id: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
+    revision: str = Field(default='', max_length=64)
 
 
 class MissionContinue(Command):
@@ -53,7 +58,8 @@ class MissionCancel(Command):
 
 
 class Operation(Command):
-    operation: Literal["mapping.start", "mapping.save", "mapping.finish", "navigation.start", "navigation.stop"]
+    operation: Literal["mapping.start", "mapping.save", "mapping.finish", "mapping.stop", "navigation.start", "navigation.start-manual", "navigation.continue", "navigation.prepare", "navigation.stop"]
+    name: str = Field(default="", max_length=48, pattern=r"^[a-zA-Z0-9_\u4e00-\u9fff-]*$")
 
 
 class WaypointEdit(Payload):
@@ -76,10 +82,24 @@ class MissionCreate(MissionEdit):
     id: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
 
 
-def create_app(settings=None, adapter=None):
+class InitialPose(Command):
+    x: float = Field(strict=True, allow_inf_nan=False)
+    y: float = Field(strict=True, allow_inf_nan=False)
+    yaw: float = Field(strict=True, allow_inf_nan=False, ge=-3.141593, le=3.141593)
+
+
+class GoTo(Command):
+    waypoint_id: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
+    revision: str = Field(default='', max_length=64)
+
+
+def create_app(settings=None, adapter=None, mapping=None, navigation=None):
     settings = settings or Settings.from_env()
-    robot = adapter or (MockAdapter(settings) if settings.mode == "mock" else LocalAdapter() if settings.mode == "local" else RosReadOnlyAdapter())
+    robot = adapter or (MockAdapter(settings) if settings.mode == "mock" else LocalAdapter() if settings.mode == "local" else RosControlAdapter(settings) if settings.mode == 'ros_control' else RosReadOnlyAdapter(settings))
     workspace = None if settings.mode == "mock" else WorkspaceData(settings)
+    mapper = mapping or MappingManager(settings)
+    navigator = navigation or NavigationManager(settings, robot)
+    journal = CommandJournal(Path(settings.workspace) / 'runtime/navigation/web/commands.sqlite3') if settings.mode == 'ros_control' else None
     lease, cache, command_lock = ControlLease(settings.lease_seconds), CommandCache(), asyncio.Lock()
     sessions = OrderedDict()
     instance_id = uuid.uuid4().hex
@@ -91,12 +111,16 @@ def create_app(settings=None, adapter=None):
             await robot.start()
             yield
         finally:
+            await navigator.close()
+            await mapper.close()
             await robot.close()
 
     app = FastAPI(title="G1 Web Gateway · 框架", version="0.1.0", lifespan=lifespan,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.robot, app.state.lease = robot, lease
     app.state.workspace = workspace
+    app.state.mapping = mapper
+    app.state.navigation = navigator
 
     @app.exception_handler(GatewayError)
     async def gateway_error(request, exc):
@@ -125,9 +149,21 @@ def create_app(settings=None, adapter=None):
     async def state():
         nonlocal sequence
         data = await robot.snapshot()
+        mapping_state = await mapper.snapshot()
+        data['mapping'] = mapping_state
+        lifecycle = await navigator.snapshot()
+        data.setdefault('navigation', {}).update(lifecycle=lifecycle)
+        data['capabilities']['navigation_control'] = navigator.enabled
+        data['capabilities']['mapping_control'] = mapping_state['available']
         if workspace:
             configuration, map_data = await asyncio.to_thread(workspace.status)
             data["configuration"], data["map"] = configuration, map_data
+            if mapping_state['active'] or mapping_state['busy']:
+                configuration['write_blocker'] = '建图进行中，请结束建图后编辑导航配置'
+            elif mapping_state['available'] and mapping_state['phase'] == 'UNKNOWN':
+                configuration['write_blocker'] = '建图状态未知，请核对进程后编辑导航配置'
+            elif lifecycle['busy']:
+                configuration['write_blocker'] = '定位与导航准备中，请完成后编辑配置'
             data["capabilities"].update(waypoint_write=configuration["available"], mission_write=configuration["available"])
         sequence += 1
         return {"type": "state", "schema_version": 1, "instance_id": instance_id,
@@ -212,10 +248,39 @@ def create_app(settings=None, adapter=None):
 
     async def command(name, payload, secret, action):
         async with command_lock:
-            if settings.mode != "mock":
+            if settings.mode not in {"mock", 'ros_control'}:
                 robot.unsupported()
             lease.require(secret)
             fingerprint = name + json.dumps(payload.model_dump(mode="json"), sort_keys=True)
+            if journal:
+                previous = await asyncio.to_thread(journal.begin, str(payload.request_id), fingerprint)
+                if previous is not None:
+                    return previous
+                try:
+                    mapping_state = await mapper.snapshot()
+                    if name not in ('cancel', 'close_gate'):
+                        if mapping_state['active'] or mapping_state['busy'] or mapping_state['phase'] == 'UNKNOWN':
+                            raise GatewayError(409, 'MAPPING_BUSY', '建图运行或状态未知，不能执行导航命令')
+                        if name in ('start', 'go_to'):
+                            blocker = await asyncio.to_thread(navigator.blocker)
+                            if blocker:
+                                raise GatewayError(409, 'NAVIGATION_BLOCKED', blocker)
+                        if name in ('start', 'go_to') and (await navigator.snapshot())['busy']:
+                            raise GatewayError(409, 'NAVIGATION_BUSY', '导航准备操作尚未完成')
+                        if name in ('start', 'go_to'):
+                            if not payload.revision:
+                                raise GatewayError(428, 'REVISION_REQUIRED', '请重新载入任务和导航点后预览')
+                            current = await asyncio.to_thread(workspace.catalog)
+                            await asyncio.to_thread(workspace.map)
+                            if current['revision'] != payload.revision:
+                                raise GatewayError(409, 'CONFIGURATION_CHANGED', '目标或任务配置已变化，请重新预览后开始')
+                    detail = await action()
+                    result = dict(detail, accepted=True, simulated=False, request_id=str(payload.request_id), operation_id=str(payload.request_id))
+                    await asyncio.to_thread(journal.finish, str(payload.request_id), result)
+                    return result
+                except GatewayError as exc:
+                    await asyncio.to_thread(journal.finish, str(payload.request_id), error=(exc.status, exc.code, exc.message))
+                    raise
             previous = cache.get(secret, str(payload.request_id), fingerprint)
             if previous is not None:
                 return previous
@@ -238,11 +303,26 @@ def create_app(settings=None, adapter=None):
     async def cancel(payload: MissionCancel, x_control_lease: str = Header(default="")):
         return await command("cancel", payload, x_control_lease, lambda: robot.cancel_mission(payload.run_id))
 
+    @app.post('/api/v1/navigation/go-to', status_code=202, dependencies=[Depends(auth)])
+    async def go_to(payload: GoTo, x_control_lease: str = Header(default='')):
+        return await command('go_to', payload, x_control_lease, lambda: robot.go_to(payload.waypoint_id))
+
+    @app.post('/api/v1/navigation/initial-pose', status_code=202, dependencies=[Depends(auth)])
+    async def initial_pose(payload: InitialPose, x_control_lease: str = Header(default='')):
+        return await command('initial_pose', payload, x_control_lease, lambda: robot.initial_pose(payload.x, payload.y, payload.yaw))
+
     async def save_configuration(kind, operation, identifier, payload, secret, revision):
         if not workspace:
             raise GatewayError(501, "DEMO_DATA", "模拟目录不可写，请使用默认 local 模式编辑本地数据")
         async with command_lock:
             lease.require(secret)
+            mapping_state = await mapper.snapshot()
+            if (await navigator.snapshot())['busy']:
+                raise GatewayError(409, 'NAVIGATION_BUSY', '导航准备中，不能修改导航配置')
+            if mapping_state['active'] or mapping_state['busy']:
+                raise GatewayError(409, 'MAPPING_BUSY', '建图进行中，不能修改导航配置')
+            if mapping_state['available'] and mapping_state['phase'] == 'UNKNOWN':
+                raise GatewayError(409, 'MAPPING_UNKNOWN', '建图状态未知，请核对进程后编辑导航配置')
             mission = (await robot.snapshot())["mission"]
             if mission["active"]:
                 raise GatewayError(409, "MISSION_BUSY", "任务运行中，请结束后再修改配置")
@@ -273,8 +353,72 @@ def create_app(settings=None, adapter=None):
         return await save_configuration("missions", "delete", mission_id, None, x_control_lease, if_match)
 
     @app.post("/api/v1/operations", dependencies=[Depends(auth)])
-    async def operations(payload: Operation):
-        raise GatewayError(501, "NOT_IMPLEMENTED", "进程控制尚未接入；未执行任何脚本")
+    async def operations(payload: Operation, x_control_lease: str = Header(default="")):
+        manager = mapper if payload.operation.startswith('mapping.') else navigator
+        if not manager.enabled:
+            raise GatewayError(501, "NOT_IMPLEMENTED", "该环境或进程操作尚未接入")
+        async with command_lock:
+            lease.require(x_control_lease)
+            if (await robot.snapshot())['mission']['active']:
+                raise GatewayError(409, 'MISSION_BUSY', '任务运行中，不能操作建图')
+            if payload.operation == 'mapping.start' and (await robot.snapshot()).get('stack_present'):
+                raise GatewayError(409, 'NAVIGATION_BUSY', '定位或导航节点仍在运行，请先结束导航')
+            other = navigator if manager is mapper else mapper
+            if (await other.snapshot())['busy']:
+                raise GatewayError(409, 'STACK_BUSY', '建图或导航操作正在进行')
+            result = await manager.submit(payload.request_id, payload.operation, payload.name)
+            if (payload.operation == 'mapping.start' and hasattr(robot, 'mapping_preview')
+                    and getattr(app.state, 'preview_operation', None) != result['operation_id']):
+                robot.mapping_preview.reset()
+                app.state.preview_operation = result['operation_id']
+            return JSONResponse(result, status_code=202)
+
+    @app.get('/api/v1/operations/{operation_id}', dependencies=[Depends(auth)])
+    async def operation_state(operation_id: str):
+        try:
+            identifier = str(uuid.UUID(operation_id))
+        except ValueError as exc:
+            raise GatewayError(404, 'OPERATION_NOT_FOUND', '操作不存在') from exc
+        if navigator.records.exists() and (navigator.records / (identifier + '.json')).exists():
+            return await asyncio.to_thread(navigator.operation, operation_id)
+        return await asyncio.to_thread(mapper.operation, operation_id)
+
+    @app.get('/api/v1/navigation', dependencies=[Depends(auth)])
+    async def navigation_state():
+        return dict((await robot.snapshot()).get('navigation', {}), lifecycle=await navigator.snapshot())
+
+    @app.get('/api/v1/navigation/logs', dependencies=[Depends(auth)])
+    async def navigation_logs():
+        return {'logs': await asyncio.to_thread(navigator.logs)}
+
+    @app.get('/api/v1/navigation/report', dependencies=[Depends(auth)])
+    async def navigation_report(goal_id: str):
+        if settings.mode != 'ros_control':
+            robot.unsupported()
+        try:
+            identifier = str(uuid.UUID(goal_id))
+        except ValueError as exc:
+            raise GatewayError(404, 'REPORT_NOT_FOUND', '任务报告不存在') from exc
+        from .mapping import read_json
+        saved = await asyncio.to_thread(read_json, Path(settings.workspace) / 'runtime/missions/actions' / (identifier + '.json'))
+        report = Path(saved.get('report_path', '')).resolve() if saved else None
+        root = (Path(settings.workspace) / 'runtime/missions').resolve()
+        if not report or not report.is_relative_to(root) or report.suffix != '.json' or not report.is_file():
+            raise GatewayError(404, 'REPORT_NOT_FOUND', '尚未生成可下载的任务报告')
+        return FileResponse(report, filename=report.name, media_type='application/json', headers={'Cache-Control':'private, no-store'})
+
+    @app.get('/api/v1/mapping', dependencies=[Depends(auth)])
+    async def mapping_state():
+        return await mapper.snapshot()
+
+    @app.get('/api/v1/mapping/logs', dependencies=[Depends(auth)])
+    async def mapping_logs():
+        return {'logs': await asyncio.to_thread(mapper.logs)}
+
+    @app.get('/api/v1/mapping/artifact', dependencies=[Depends(auth)])
+    async def mapping_artifact(session_id: str):
+        path = await asyncio.to_thread(mapper.artifact, session_id)
+        return FileResponse(path, filename=path.name, media_type='application/octet-stream', headers={'Cache-Control': 'private, no-store'})
 
     @app.websocket("/ws/state")
     async def stream(websocket: WebSocket):

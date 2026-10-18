@@ -54,6 +54,14 @@ def positive_seconds(value):
     return result
 
 
+def terminal_failure(status, now_ns):
+    """Only final failure states end the wait; candidate verification/retry keep waiting."""
+    return (isinstance(status, dict)
+            and isinstance(status.get("state"), str)
+            and status["state"] in {"FAILED", "AMBIGUOUS"}
+            and stamp_problem(status, "stamp_ns", now_ns, 1.0) is None)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timeout", type=positive_seconds)
@@ -98,10 +106,7 @@ def main(argv=None):
         report(last_reason)
         if ready:
             result = 0
-        elif (isinstance(status, dict)
-              and isinstance(status.get("state"), str)
-              and status.get("state") in {"FAILED", "AMBIGUOUS"}
-              and stamp_problem(status, "stamp_ns", now_ns, 1.0) is None):
+        elif terminal_failure(status, now_ns):
             result = 1
 
     qos = QoSProfile(

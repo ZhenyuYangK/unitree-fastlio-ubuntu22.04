@@ -64,9 +64,21 @@ def room(sample_offset=0.0):
     return np.asarray(points, dtype=np.float32)
 
 
-def independent_scan(sample_offset):
+def feature(sample_offset=0.0):
+    points = []
+    for x in [-.2, 3.5]:
+        for y in np.arange(-2.6 + sample_offset * .05, 3.2, .10):
+            for z in np.arange(-.55, 1.35, .13):
+                points.append((x, y, z))
+    return np.asarray(points, dtype=np.float32)
+
+
+def independent_scan(sample_offset, unique_feature=False):
     # Samples differ from the map; remove observations and add sensor noise.
-    points = (room(sample_offset) - POSITION) @ (RZ @ BODY_ROLL)
+    source = room(sample_offset)
+    if unique_feature:
+        source = np.concatenate((source, feature(sample_offset)))
+    points = (source - POSITION) @ (RZ @ BODY_ROLL)
     indices = np.arange(len(points))
     points = points[indices % 7 != 0].copy()
     indices = indices[indices % 7 != 0]
@@ -139,6 +151,7 @@ class RelocalizationNodeTest(unittest.TestCase):
         value = json.loads(message.data)
         self.assertIs(type(value.get("valid")), bool, message.data)
         self.assertIs(type(value.get("stamp_ns")), int, message.data)
+        json.dumps(value, allow_nan=False)
         self.statuses.append(value)
 
     def receive_tf(self, message):
@@ -153,10 +166,12 @@ class RelocalizationNodeTest(unittest.TestCase):
             with self.logs_lock:
                 self.logs.append(line)
 
-    def launch(self, mode="global", duplicate=False, **overrides):
+    def launch(self, mode="global", duplicate=False, unique_feature=False, **overrides):
         points = room()
         if duplicate:
             points = np.concatenate((points, points + np.array([14.0, 0.0, 0.0])))
+        if unique_feature:
+            points = np.concatenate((points, feature()))
         map_path = Path(self.directory.name) / "map.pcd"
         write_pcd(map_path, points)
         parameters = {
@@ -175,6 +190,8 @@ class RelocalizationNodeTest(unittest.TestCase):
             "global_max_fitness": 0.4, "global_collection_sec": 0.25,
             "global_min_scan_count": 3, "global_search_timeout_sec": 10.0,
             "verification_timeout_sec": 5.0, "confirmation_scan_count": 3,
+            "global_initialization_timeout_sec": 15.0,
+            "diagnostics_directory": self.directory.name,
             "localization_period_ms": 100, "max_scan_age_sec": 0.8,
             "localization_valid_timeout_sec": 1.2,
         }
@@ -298,6 +315,16 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.assert_correct_localization()
         self.assertTrue(any(status["state"] == "COLLECTING" for status in self.statuses))
         self.assertEqual(self.statuses[-1]["initialization_mode"], "global")
+        records = list(Path(self.directory.name).glob('global_*.json'))
+        self.assertTrue(records)
+        record = json.loads(records[0].read_text())
+        self.assertTrue(record['candidates'])
+        self.assertIn('initial_yaw', record['candidates'][0])
+        self.assertTrue(records[0].with_suffix('.pcd').is_file())
+        comparisons = list(Path(self.directory.name).glob('verification_*.jsonl'))
+        self.assertTrue(comparisons)
+        for line in comparisons[0].read_text().splitlines():
+            self.assertTrue(json.loads(line)['candidates'])
         self.pump(0.3, sensor=True, repeat=True)  # Drain any earlier fresh observation.
         baseline_success = self.statuses[-1]["last_success_stamp_ns"]
         self.pump(1.6, sensor=True, repeat=True)
@@ -311,11 +338,53 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.assert_correct_localization()  # Distinct new scans can reconfirm.
 
     def test_duplicate_rooms_fail_closed_and_manual_pose_can_resolve(self):
-        self.launch(duplicate=True)
+        self.launch(duplicate=True, verification_timeout_sec=0.7, global_max_attempts=2)
         self.wait_for(lambda: self.statuses[-1]["state"] in ("AMBIGUOUS", "FAILED"),
                       sensor=True)
         self.assertEqual(self.statuses[-1]["state"], "AMBIGUOUS", self.log_text())
+        self.assertTrue(any(status['state'] == 'VERIFYING_CANDIDATES' for status in self.statuses))
+        self.assertTrue(any(status.get('attempt') == 2 for status in self.statuses))
         self.pump(0.4, sensor=True)
+        self.assert_no_localization()
+        self.initial_pose()
+        self.assert_correct_localization()
+
+    def test_ambiguous_candidates_retry_and_new_geometry_selects_correct_location(self):
+        self.launch(duplicate=True, unique_feature=True, verification_timeout_sec=0.8,
+                    global_max_attempts=3)
+        # Initial scans omit the distinctive walls: both locations are plausible.
+        self.wait_for(lambda: any(s.get('attempt', 0) >= 2 for s in self.statuses), sensor=True)
+        self.assert_no_localization()
+        self.scan_data = [independent_scan(.41 + i*.07, unique_feature=True) for i in range(5)]
+        self.assert_correct_localization()
+        self.assertIn('Verified candidate', self.log_text())
+        self.assertTrue(any(len(s.get('candidates', [])) >= 2 for s in self.statuses))
+
+    def test_total_budget_expires_during_input_outage_without_false_confirmation(self):
+        self.launch(global_initialization_timeout_sec=0.8)
+        self.publish_sensor()
+        self.pump(1.2, sensor=True, repeat=True)
+        self.assertEqual(self.statuses[-1]['state'], 'FAILED', self.log_text())
+        self.assertIn('Total automatic initialization time budget', self.statuses[-1]['reason'])
+        self.assert_no_localization()
+
+    def test_candidate_bank_does_not_count_repeated_timestamp(self):
+        self.launch(duplicate=True, unique_feature=True, global_initialization_timeout_sec=2.0)
+        self.wait_for(lambda: self.statuses[-1]['state'] == 'VERIFYING_CANDIDATES', sensor=True)
+        self.pump(.5, sensor=True, repeat=True)
+        self.assert_no_localization()
+        self.wait_for(lambda: self.statuses[-1]['state'] in ['FAILED', 'AMBIGUOUS'], timeout=4)
+        self.assert_no_localization()
+
+    def test_truncated_candidate_bank_cannot_claim_uniqueness(self):
+        self.launch(duplicate=True, global_verification_candidates=1,
+                    verification_timeout_sec=0.7, global_max_attempts=1)
+        self.wait_for(lambda: self.statuses[-1]['state'] == 'AMBIGUOUS', sensor=True)
+        self.assert_no_localization()
+
+    def test_manual_pose_interrupts_automatic_candidate_comparison(self):
+        self.launch(duplicate=True)
+        self.wait_for(lambda: self.statuses[-1]['state'] == 'VERIFYING_CANDIDATES', sensor=True)
         self.assert_no_localization()
         self.initial_pose()
         self.assert_correct_localization()

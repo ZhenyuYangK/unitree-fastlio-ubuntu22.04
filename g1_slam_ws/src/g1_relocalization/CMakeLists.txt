@@ -79,8 +79,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_global_matcher global_matcher ${PCL_LIBRARIES})
   ament_add_gtest(test_pose_buffer test/test_pose_buffer.cpp)
   target_link_libraries(test_pose_buffer Eigen3::Eigen)
+  ament_add_gtest(test_candidate_evidence test/test_candidate_evidence.cpp)
   find_package(ament_cmake_test REQUIRED)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  ament_add_test(test_wait_localization
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_wait_localization.py
+    TIMEOUT 15
+  )
   ament_add_test(test_relocalization_node
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_relocalization_node.py

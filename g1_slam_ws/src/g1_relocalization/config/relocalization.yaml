@@ -36,6 +36,13 @@ g1_relocalization:
     global_max_collection_points: 120000
     confirmation_scan_count: 3
     verification_timeout_sec: 20.0
+    # 歧义候选排序后，用同一批新扫描比较；仍无法区分时重新采集。
+    global_verification_candidates: 3
+    # 两地均匹配时，要求综合评分与覆盖率都拉开差距，抑制局部优化偏差。
+    global_confirmation_coverage_gap: 0.08
+    global_max_attempts: 3
+    # 覆盖采集、搜索、候选验证和所有重试；启动脚本统一覆盖此总预算。
+    global_initialization_timeout_sec: 180.0
     confirmation_max_translation: 0.30
     confirmation_max_rotation_deg: 10.0
 
@@ -54,6 +61,7 @@ g1_relocalization:
     global_fine_xy_step: 0.25
     global_fine_yaw_step_deg: 2.0
     global_retained_modes: 96
+    # 初始细化 12 个；其余可信竞争模式在同一搜索预算内继续细化。
     global_ndt_candidates: 12
 
     # 当前单楼层地图地面模型 z = a*x + b*y + c。

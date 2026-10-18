@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <memory>
@@ -30,6 +31,7 @@
 #include <pcl/registration/ndt.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <g1_relocalization/global_matcher.hpp>
+#include <g1_relocalization/candidate_evidence.hpp>
 #include <g1_relocalization/pose_buffer.hpp>
 
 namespace
@@ -52,6 +54,11 @@ std::string quoted(const std::string & text)
   }
   out << '"';
   return out.str();
+}
+std::string jsonNumber(double value)
+{
+  if (!std::isfinite(value)) {return "null";}
+  std::ostringstream out; out << std::setprecision(10) << value; return out.str();
 }
 Eigen::Matrix4f translation(const Eigen::Vector3f & offset)
 {
@@ -144,6 +151,14 @@ private:
   };
   using Frames = std::vector<Frame, Eigen::aligned_allocator<Frame>>;
 
+  struct Hypothesis
+  {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
+    Eigen::Matrix4f anchor = Eigen::Matrix4f::Identity();
+    bool initialized = false;
+  };
+
   void readParameters()
   {
     auto str = [this](const char * key, const std::string & value) {
@@ -174,6 +189,11 @@ private:
     max_collection_points_ = integer("global_max_collection_points", 120000);
     confirmation_frames_ = integer("confirmation_scan_count", 3);
     verification_timeout_ = number("verification_timeout_sec", 20.);
+    initialization_timeout_ = number("global_initialization_timeout_sec", 180.);
+    max_attempts_ = integer("global_max_attempts", 3);
+    max_hypotheses_ = integer("global_verification_candidates", 3);
+    confirmation_coverage_gap_ = number("global_confirmation_coverage_gap", .08);
+    diagnostics_directory_ = str("diagnostics_directory", "");
     confirmation_translation_ = number("confirmation_max_translation", .30);
     confirmation_rotation_ = number("confirmation_max_rotation_deg", 10.) * kPi / 180.;
     options_.time_budget_seconds = number("global_search_timeout_sec", 60.);
@@ -208,12 +228,14 @@ private:
     options_.max_inlier_rmse = number("global_max_inlier_rmse", .35);
     if (mode_ != "manual" && mode_ != "global") {throw std::invalid_argument("initialization_mode must be manual or global");}
     for (double v : {tracking_fitness_, max_scan_age_, valid_timeout_, odom_gap_, collect_seconds_,
-        collect_timeout_, verification_timeout_, confirmation_translation_, confirmation_rotation_})
+        collect_timeout_, verification_timeout_, initialization_timeout_,
+        confirmation_translation_, confirmation_rotation_, confirmation_coverage_gap_})
     {
       if (!std::isfinite(v) || v <= 0) {throw std::invalid_argument("Relocalization time/quality limits must be finite and positive");}
     }
     if (period_ms_ <= 0 || collection_frames_ < 2 || confirmation_frames_ < 2 ||
-      max_collection_points_ < 100 || !std::isfinite(body_roll_deg_))
+      max_collection_points_ < 100 || max_attempts_ < 1 || max_hypotheses_ < 1 ||
+      max_hypotheses_ > 16 || confirmation_coverage_gap_ > 1. || !std::isfinite(body_roll_deg_))
     {throw std::invalid_argument("Invalid collection/confirmation counts or body roll");}
     if (max_scan_age_ > valid_timeout_ || valid_timeout_ > 3.) {
       throw std::invalid_argument("Require max_scan_age_sec <= localization_valid_timeout_sec <= 3 seconds");
@@ -294,6 +316,7 @@ private:
       has_manual_ = true; generation_.fetch_add(1); valid_ = false;
       last_success_stamp_ = 0; fitness_ = std::numeric_limits<double>::infinity();
       state_ = "VERIFYING"; reason_ = "Verifying manual initialpose on new scans";
+      candidate_status_ = "[]"; initialization_attempt_ = 0;
       pending_.clear();
     }
     publishFitness(std::numeric_limits<double>::infinity());
@@ -351,6 +374,75 @@ private:
     }
   }
 
+  void candidateProgress(int attempt, const std::string & candidates, uint64_t generation)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (generation != generation_.load()) {return;}
+    initialization_attempt_ = attempt; candidate_status_ = candidates;
+  }
+
+  void recordSearch(
+    Cloud::ConstPtr scan, const g1_relocalization::GlobalMatchResult & result, int attempt,
+    int64_t stamp)
+  {
+    std::ostringstream json;
+    json << std::setprecision(10) << "{\"map_path\":" << quoted(map_path_)
+         << ",\"scan_stamp_ns\":" << stamp << ",\"attempt\":" << attempt
+         << ",\"status\":" << quoted(g1_relocalization::globalMatchStatusName(result.status))
+         << ",\"reason\":" << quoted(result.reason) << ",\"candidates\":[";
+    for (std::size_t i = 0; i < result.candidates.size(); ++i) {
+      const auto & c = result.candidates[i];
+      if (i) {json << ',';}
+      json << "{\"rank\":" << i + 1 << ",\"acceptable\":" << (c.acceptable ? "true" : "false")
+           << ",\"coarse_score\":" << c.correlative_score << ",\"score\":" << c.quality.score
+           << ",\"coverage\":" << c.quality.coverage << ",\"fitness\":";
+      if (std::isfinite(c.fitness)) {json << c.fitness;} else {json << "null";}
+      json << ",\"inlier_rmse\":";
+      if (std::isfinite(c.quality.inlier_rmse)) {json << c.quality.inlier_rmse;} else {json << "null";}
+      json << ",\"x\":" << jsonNumber(c.map_T_scan(0, 3)) << ",\"y\":" << jsonNumber(c.map_T_scan(1, 3))
+           << ",\"z\":" << jsonNumber(c.map_T_scan(2, 3)) << ",\"yaw\":"
+           << jsonNumber(std::atan2(c.map_T_scan(1, 0), c.map_T_scan(0, 0)))
+           << ",\"initial_x\":" << jsonNumber(c.initial_map_T_scan(0, 3))
+           << ",\"initial_y\":" << jsonNumber(c.initial_map_T_scan(1, 3))
+           << ",\"initial_z\":" << jsonNumber(c.initial_map_T_scan(2, 3))
+           << ",\"initial_yaw\":" << jsonNumber(std::atan2(c.initial_map_T_scan(1, 0), c.initial_map_T_scan(0, 0))) << '}';
+      RCLCPP_INFO(get_logger(), "Candidate %zu accepted=%d score=%.4f coarse=%.4f fitness=%.4f coverage=%.3f rmse=%.3f xy=(%.3f,%.3f)",
+        i + 1, c.acceptable, c.quality.score, c.correlative_score, c.fitness,
+        c.quality.coverage, c.quality.inlier_rmse, c.map_T_scan(0, 3), c.map_T_scan(1, 3));
+    }
+    json << "]}";
+    if (diagnostics_directory_.empty()) {return;}
+    const std::string base = diagnostics_directory_ + "/global_" + std::to_string(stamp) + "_" + std::to_string(attempt);
+    try {
+      if (pcl::io::savePCDFileBinary(base + ".pcd", *scan) < 0) {throw std::runtime_error("PCD write failed");}
+      std::ofstream file(base + ".json"); file << json.str() << '\n';
+      if (!file) {throw std::runtime_error("JSON write failed");}
+    } catch (const std::exception & error) {
+      RCLCPP_WARN(get_logger(), "Unable to save search evidence: %s", error.what());
+    }
+  }
+
+  void confirmPose(const Frame & frame, const Eigen::Matrix4f & map_T_odom,
+    double fitness, const g1_relocalization::MatchQuality & quality, bool first, uint64_t generation)
+  {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (generation != generation_.load()) {return;}
+      map_T_odom_ = map_T_odom; last_success_stamp_ = frame.stamp;
+      last_success_steady_ = Clock::now(); fitness_ = fitness; coverage_ = quality.coverage;
+      valid_ = true; state_ = first ? "LOCALIZED" : "TRACKING";
+      reason_ = "Confirmed on distinct, fresh synchronized scans";
+    }
+    publishFitness(fitness);
+    geometry_msgs::msg::PoseWithCovarianceStamped pose;
+    pose.header.frame_id = global_frame_; pose.header.stamp = rclcpp::Time(frame.stamp);
+    pose.pose.pose = matrixPose(map_T_odom * frame.odom_T_body * base_T_body_.inverse());
+    pose.pose.covariance[0] = pose.pose.covariance[7] = pose.pose.covariance[14] = .04;
+    pose.pose.covariance[21] = pose.pose.covariance[28] = pose.pose.covariance[35] = .01;
+    pose_pub_->publish(pose);
+    if (first) {RCLCPP_INFO(get_logger(), "NDT success: confirmed fitness=%.6f coverage=%.3f", fitness, quality.coverage);}
+  }
+
   void runWorker()
   {
     pcl::NormalDistributionsTransform<g1_relocalization::GlobalPoint, g1_relocalization::GlobalPoint> ndt;
@@ -364,16 +456,60 @@ private:
     Eigen::Matrix4f map_T_odom = Eigen::Matrix4f::Identity();
     Eigen::Matrix4f anchor = map_T_odom;
     auto collecting_since = Clock::now(), verifying_since = Clock::now(), last_track = Clock::now();
-    int64_t verification_after = 0;
+    int64_t verification_after = 0, search_stamp = 0;
+    std::vector<Hypothesis, Eigen::aligned_allocator<Hypothesis>> hypotheses;
+    std::vector<g1_relocalization::CandidateEvidence> evidence;
+    bool omitted_candidates = false, automatic_done = false, automatic_started = false;
+    int attempts = 0;
+    auto initialization_since = Clock::now();
+    std::string last_failure_state = "FAILED";
+    auto expired = [&]() {
+        return automatic_started && Clock::now() - initialization_since >=
+          std::chrono::duration<double>(initialization_timeout_);
+      };
+    auto retry = [&](const std::string & state, const std::string & reason) {
+        hypotheses.clear(); evidence.clear(); collection.clear();
+        omitted_candidates = false; verification_after = now().nanoseconds();
+        candidateProgress(attempts, "[]", generation);
+        last_failure_state = state;
+        publishFitness(std::numeric_limits<double>::infinity());
+        if (attempts >= max_attempts_ || expired()) {
+          automatic_done = attempted = true;
+          setState(state, reason + "; automatic initialization exhausted after " +
+            std::to_string(attempts) + " attempts; set initialpose to continue", generation);
+        } else {
+          attempted = false;
+          collecting_since = Clock::now();
+          setState("RETRYING", reason + "; collecting NEW scans for attempt " +
+            std::to_string(attempts + 1) + "/" + std::to_string(max_attempts_), generation);
+        }
+      };
     while (!stopping_.load() && rclcpp::ok()) {
       const uint64_t current_generation = generation_.load();
       if (generation != current_generation) {
         generation = current_generation; seeded = attempted = confirmed = false;
         confirmations = 0; collection.clear(); verification_after = 0;
         collecting_since = Clock::now();
+        hypotheses.clear(); evidence.clear(); omitted_candidates = false;
+        automatic_done = automatic_started = false; attempts = 0;
+        last_failure_state = "FAILED";
       }
-      // Timeouts also advance during an input outage. A failed attempt remains
-      // terminal until a new /initialpose changes the generation (or restart).
+      bool manual;
+      Eigen::Matrix4f manual_guess;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        manual = has_manual_; manual_guess = manual_guess_;
+      }
+      if (!manual && mode_ == "global" && !automatic_done && expired()) {
+        retry(last_failure_state, "Total automatic initialization time budget expired");
+      }
+      if (!hypotheses.empty() && Clock::now() - verifying_since >
+        std::chrono::duration<double>(verification_timeout_))
+      {
+        retry("AMBIGUOUS", "Ranked candidates remain competing or unverified on fresh scans");
+      }
+      // Manual/recovery timeouts stay terminal until a new initialpose. The
+      // global candidate bank retries within one shared initialization deadline.
       if (!confirmed && seeded && Clock::now() - verifying_since >
         std::chrono::duration<double>(verification_timeout_))
       {
@@ -385,20 +521,113 @@ private:
         std::chrono::duration<double>(collect_timeout_))
       {
         collection.clear(); attempted = true;
-        setState("FAILED", "Unable to collect enough fresh synchronized scans", generation);
+        ++attempts;
+        retry("FAILED", "Unable to collect enough fresh synchronized scans");
       }
       Frame frame;
       if (!nextFrame(frame)) {continue;}
       if (generation != generation_.load()) {continue;}
-      bool manual;
-      Eigen::Matrix4f manual_guess;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        manual = has_manual_; manual_guess = manual_guess_;
         if (!valid_ && confirmed) {
           confirmed = false; confirmations = 0; anchor = map_T_odom;
           verifying_since = Clock::now();
         }
+      }
+      if (!hypotheses.empty()) {
+        if (frame.stamp <= verification_after) {continue;}
+        const auto gravity_scan = gravityScan(frame);
+        std::vector<double> fitnesses;
+        std::vector<g1_relocalization::MatchQuality> qualities;
+        std::ostringstream progress;
+        progress << std::setprecision(6) << '[';
+        bool interrupted = false;
+        for (std::size_t i = 0; i < hypotheses.size(); ++i) {
+          auto & hypothesis = hypotheses[i];
+          ndt.setInputSource(frame.cloud);
+          Cloud aligned; ndt.align(aligned, hypothesis.transform * frame.odom_T_body);
+          if (stopping_.load() || generation != generation_.load() || expired()) {interrupted = true; break;}
+          const double fitness = ndt.hasConverged() ? ndt.getFitnessScore() : std::numeric_limits<double>::infinity();
+          const auto fitted = ndt.getFinalTransformation().eval();
+          const auto transform = (fitted * frame.odom_T_body.inverse()).eval();
+          const auto quality = matcher_->evaluate(gravity_scan,
+            transform * translation(frame.odom_T_body.block<3, 1>(0, 3)));
+          const bool stable = (transform.block<3, 1>(0, 3) - hypothesis.anchor.block<3, 1>(0, 3)).norm() <=
+            (hypothesis.initialized ? confirmation_translation_ : options_.max_refinement_translation) &&
+            rotationDistance(transform, hypothesis.anchor) <=
+            (hypothesis.initialized ? confirmation_rotation_ : options_.max_refinement_yaw_deg * kPi / 180.);
+          const bool accepted = ndt.hasConverged() && fitted.allFinite() && quality.acceptable && stable &&
+            std::isfinite(fitness) && fitness <= options_.max_fitness;
+          auto support = quality;
+          bool geometric_rejection = false;
+          if (!accepted) {
+            const auto reference = matcher_->evaluate(gravity_scan,
+              hypothesis.anchor * translation(frame.odom_T_body.block<3, 1>(0, 3)));
+            support.score = std::max(support.score, reference.score);
+            support.coverage = std::max(support.coverage, reference.coverage);
+            geometric_rejection = hypothesis.initialized && stable && ndt.hasConverged() &&
+              !quality.acceptable && !reference.acceptable;
+          }
+          evidence[i].observe(accepted, support.score, support.coverage, geometric_rejection);
+          if (accepted) {
+            hypothesis.transform = transform;
+            if (!hypothesis.initialized) {hypothesis.anchor = transform; hypothesis.initialized = true;}
+          }
+          fitnesses.push_back(fitness); qualities.push_back(quality);
+          if (i) {progress << ',';}
+          progress << "{\"candidate\":" << i + 1 << ",\"score\":" << evidence[i].score()
+                   << ",\"samples\":" << evidence[i].count() << ",\"accepted\":" << (accepted ? "true" : "false")
+                   << ",\"stable\":" << (evidence[i].stable() ? "true" : "false")
+                   << ",\"coverage\":" << support.coverage
+                   << ",\"geometric_rejection\":" << (geometric_rejection ? "true" : "false")
+                   << ",\"fitness\":" << jsonNumber(fitness) << ",\"rmse\":" << jsonNumber(quality.inlier_rmse)
+                   << ",\"x\":" << jsonNumber(transform(0, 3)) << ",\"y\":" << jsonNumber(transform(1, 3)) << '}';
+        }
+        if (interrupted) {continue;}
+        if (Clock::now() - verifying_since > std::chrono::duration<double>(verification_timeout_)) {
+          retry("AMBIGUOUS", "Ranked candidate verification time budget expired"); continue;
+        }
+        // A slow comparison invalidates the ENTIRE batch; no candidate gets
+        // confirmation credit for an expired scan or a longer processing turn.
+        if (!g1_relocalization::freshStamp(frame.stamp, now().nanoseconds(), max_scan_age_)) {
+          for (auto & item : evidence) {item = g1_relocalization::CandidateEvidence(confirmation_frames_);}
+          continue;
+        }
+        progress << ']'; candidateProgress(attempts, progress.str(), generation);
+        if (!diagnostics_directory_.empty()) {
+          std::ofstream file(diagnostics_directory_ + "/verification_" + std::to_string(search_stamp) +
+            "_" + std::to_string(attempts) + ".jsonl", std::ios::app);
+          file << "{\"stamp_ns\":" << frame.stamp << ",\"omitted_candidates\":"
+               << (omitted_candidates ? "true" : "false") << ",\"candidates\":" << progress.str() << "}\n";
+        }
+        // Independent seeds can converge onto the same physical pose. Merge
+        // only after BOTH have stable evidence, without adding their scan counts.
+        std::vector<int> distinct;
+        std::vector<g1_relocalization::CandidateEvidence> comparison;
+        for (std::size_t i = 0; i < hypotheses.size(); ++i) {
+          bool duplicate = false;
+          for (int prior : distinct) {
+            if (evidence[i].stable() && evidence[prior].stable() &&
+              (hypotheses[i].transform.block<3, 1>(0, 3) - hypotheses[prior].transform.block<3, 1>(0, 3)).norm() < confirmation_translation_ &&
+              rotationDistance(hypotheses[i].transform, hypotheses[prior].transform) < confirmation_rotation_)
+            {duplicate = true; break;}
+          }
+          if (!duplicate) {distinct.push_back(i); comparison.push_back(evidence[i]);}
+        }
+        const int selected = g1_relocalization::verifiedWinner(
+          comparison, options_.ambiguity_score_gap, omitted_candidates, confirmation_coverage_gap_);
+        const int winner = selected < 0 ? -1 : distinct[selected];
+        if (winner >= 0) {
+          RCLCPP_INFO(get_logger(), "Verified candidate %d selected after ranked fresh-scan comparison: %s", winner + 1, progress.str().c_str());
+          map_T_odom = hypotheses[winner].transform; anchor = map_T_odom;
+          seeded = confirmed = automatic_done = true;
+          confirmPose(frame, map_T_odom, fitnesses[winner], qualities[winner], true, generation);
+          hypotheses.clear(); evidence.clear();
+        } else {
+          setState("VERIFYING_CANDIDATES", "Comparing " + std::to_string(hypotheses.size()) +
+            " ranked candidates on the same fresh scans" + (omitted_candidates ? "; additional plausible modes remain unresolved" : ""), generation);
+        }
+        continue;
       }
       if (!seeded && manual && !attempted) {
         map_T_odom = manual_guess * frame.odom_T_body.inverse();
@@ -406,13 +635,16 @@ private:
         setState("VERIFYING", "Confirming supplied initialpose with independent fresh scans", generation);
       }
       if (!seeded && !manual) {
-        if (mode_ == "manual" || attempted) {continue;}
+        if (mode_ == "manual" || attempted || automatic_done || frame.stamp <= verification_after) {continue;}
+        if (!automatic_started) {automatic_started = true; initialization_since = Clock::now();}
         if (collection.empty()) {collecting_since = Clock::now();}
         collection.push_back(frame);
-        setState("COLLECTING", "Accumulating synchronized scans without an initial pose", generation);
+        candidateProgress(attempts + 1, "[]", generation);
+        setState("COLLECTING", "Accumulating synchronized scans for attempt " +
+          std::to_string(attempts + 1) + "/" + std::to_string(max_attempts_), generation);
         const double span = (collection.back().stamp - collection.front().stamp) / 1e9;
         if (Clock::now() - collecting_since > std::chrono::duration<double>(collect_timeout_)) {
-          attempted = true; setState("FAILED", "Unable to collect enough fresh synchronized scans", generation); continue;
+          ++attempts; retry("FAILED", "Unable to collect enough fresh synchronized scans"); continue;
         }
         if (span < collect_seconds_ || int(collection.size()) < collection_frames_) {continue;}
         auto accumulated = Cloud::Ptr(new Cloud);
@@ -428,24 +660,53 @@ private:
         }
         accumulated = filter(accumulated, options_.scan_voxel_size);
         if (accumulated->size() > static_cast<std::size_t>(max_collection_points_)) {
-          attempted = true; setState("FAILED", "Accumulated scan exceeds configured point budget", generation); continue;
+          ++attempts; retry("FAILED", "Accumulated scan exceeds configured point budget"); continue;
         }
+        ++attempts;
+        search_stamp = frame.stamp;
+        candidateProgress(attempts, "[]", generation);
         setState("SEARCHING", "Searching the full configured map and all yaw angles", generation);
-        const auto result = matcher_->search(accumulated, [this, generation]() {
-            return stopping_.load() || generation != generation_.load() || !rclcpp::ok();});
+        const auto result = matcher_->search(accumulated, [this, generation, &expired]() {
+            return stopping_.load() || generation != generation_.load() || !rclcpp::ok() || expired();});
         if (generation != generation_.load() || stopping_.load()) {continue;}
-        attempted = true;
         RCLCPP_INFO(get_logger(), "Global search %s in %.2fs (%zu evaluations): %s",
           g1_relocalization::globalMatchStatusName(result.status), result.elapsed_seconds,
           result.evaluations, result.reason.c_str());
-        if (result.status != g1_relocalization::GlobalMatchStatus::SUCCESS || result.candidates.empty()) {
-          setState(result.status == g1_relocalization::GlobalMatchStatus::AMBIGUOUS ? "AMBIGUOUS" : "FAILED",
-            result.reason, generation); collection.clear(); continue;
+        recordSearch(accumulated, result, attempts, frame.stamp);
+        if (expired() || (result.status != g1_relocalization::GlobalMatchStatus::SUCCESS &&
+          result.status != g1_relocalization::GlobalMatchStatus::AMBIGUOUS) ||
+          result.candidates.empty() || !result.candidates.front().acceptable)
+        {
+          retry("FAILED", expired() ? "Total automatic initialization time budget expired" : result.reason);
+          continue;
         }
-        map_T_odom = result.candidates.front().map_T_scan * translation(-origin);
-        anchor = map_T_odom; seeded = true; confirmations = 0;
-        verification_after = frame.stamp; verifying_since = Clock::now(); collection.clear();
-        setState("VERIFYING", "Global candidate found; waiting for independent fresh scans", generation);
+        const auto & best = result.candidates.front();
+        for (const auto & candidate : result.candidates) {
+          const bool plausible = candidate.acceptable ?
+            best.quality.score - candidate.quality.score < options_.ambiguity_score_gap :
+            candidate.correlative_score >= best.correlative_score - options_.unresolved_score_gap;
+          if (!plausible && !candidate.acceptable) {continue;}
+          const auto pose = (candidate.acceptable ? candidate.map_T_scan : candidate.initial_map_T_scan).eval();
+          Hypothesis hypothesis;
+          hypothesis.transform = pose * translation(-origin); hypothesis.anchor = hypothesis.transform;
+          hypothesis.initialized = candidate.acceptable;
+          bool duplicate = false;
+          for (const auto & prior : hypotheses) {
+            if ((hypothesis.transform.block<3, 1>(0, 3) - prior.transform.block<3, 1>(0, 3)).norm() < confirmation_translation_ &&
+              rotationDistance(hypothesis.transform, prior.transform) < confirmation_rotation_) {duplicate = true; break;}
+          }
+          if (duplicate) {continue;}
+          if (hypotheses.size() >= static_cast<std::size_t>(max_hypotheses_)) {
+            if (plausible) {omitted_candidates = true;}
+            continue;
+          }
+          hypotheses.push_back(hypothesis); evidence.emplace_back(confirmation_frames_);
+        }
+        // New data must have been acquired AFTER search, not merely queued
+        // while the search used its original input.
+        verification_after = now().nanoseconds(); verifying_since = Clock::now(); collection.clear();
+        last_failure_state = "AMBIGUOUS";
+        setState("VERIFYING_CANDIDATES", "Verifying ranked candidates against independent fresh scans", generation);
         continue;
       }
       if (!seeded || frame.stamp <= verification_after) {continue;}
@@ -483,24 +744,7 @@ private:
       }
       const bool first_success = !confirmed;
       confirmed = true;
-      {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (generation != generation_.load()) {continue;}
-        map_T_odom_ = map_T_odom; last_success_stamp_ = frame.stamp;
-        last_success_steady_ = Clock::now(); fitness_ = fitness; coverage_ = quality.coverage;
-        valid_ = true; state_ = first_success ? "LOCALIZED" : "TRACKING";
-        reason_ = "Confirmed on distinct, fresh synchronized scans";
-      }
-      publishFitness(fitness);
-      geometry_msgs::msg::PoseWithCovarianceStamped pose;
-      pose.header.frame_id = global_frame_;
-      pose.header.stamp = rclcpp::Time(frame.stamp);
-      pose.pose.pose = matrixPose(fitted * base_T_body_.inverse());
-      // Fixed non-zero diagnostic covariance; not a calibrated uncertainty estimate.
-      pose.pose.covariance[0] = pose.pose.covariance[7] = pose.pose.covariance[14] = .04;
-      pose.pose.covariance[21] = pose.pose.covariance[28] = pose.pose.covariance[35] = .01;
-      pose_pub_->publish(pose);
-      if (first_success) {RCLCPP_INFO(get_logger(), "NDT success: confirmed fitness=%.6f coverage=%.3f", fitness, quality.coverage);}
+      confirmPose(frame, map_T_odom, fitness, quality, first_success, generation);
     }
   }
 
@@ -526,7 +770,9 @@ private:
           << ",\"last_success_stamp_ns\":" << last_success_stamp_
           << ",\"fitness\":";
       if (std::isfinite(fitness_)) {out << fitness_;} else {out << "null";}
-      out << ",\"coverage\":" << coverage_ << ",\"initialization_mode\":" << quoted(mode_) << "}";
+      out << ",\"coverage\":" << coverage_ << ",\"initialization_mode\":" << quoted(mode_)
+          << ",\"attempt\":" << initialization_attempt_ << ",\"max_attempts\":" << max_attempts_
+          << ",\"candidates\":" << candidate_status_ << "}";
       msg.data = out.str();
     }
     status_pub_->publish(msg);
@@ -551,6 +797,10 @@ private:
   }
 
   std::string map_path_, mode_, global_frame_, odom_frame_, body_frame_, cloud_topic_, odom_topic_, initial_topic_;
+  std::string diagnostics_directory_, candidate_status_ = "[]";
+  int max_attempts_ = 3, max_hypotheses_ = 3, initialization_attempt_ = 0;
+  double initialization_timeout_ = 180.;
+  double confirmation_coverage_gap_ = .08;
   double body_roll_deg_ = 180., tracking_fitness_ = 2., max_scan_age_ = 2., valid_timeout_ = 3., odom_gap_ = .1;
   double collect_seconds_ = 2., collect_timeout_ = 15., verification_timeout_ = 20.;
   double confirmation_translation_ = .3, confirmation_rotation_ = .1745;

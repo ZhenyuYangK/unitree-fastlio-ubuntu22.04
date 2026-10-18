@@ -16,7 +16,7 @@ class LocalizationHealthTest(unittest.TestCase):
         self.assertTrue(localization_status_reason(self.status, .1, self.now))
 
     def test_lost_and_ambiguous_are_not_healthy(self):
-        for state in ('LOST', 'VERIFYING', 'SEARCHING', 'AMBIGUOUS'):
+        for state in ('LOST', 'VERIFYING', 'VERIFYING_CANDIDATES', 'RETRYING', 'SEARCHING', 'AMBIGUOUS'):
             self.status['state'] = state
             self.assertTrue(localization_status_reason(self.status, .1, self.now))
 

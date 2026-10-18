@@ -12,6 +12,8 @@
 **/__pycache__/
 *.pyc
 *.g1_waypoints.lock
+*.g1_missions.lock
+/g1_slam_ws/backup/web_console/
 /g1_slam_ws/src/FAST_LIO_ROS2/Log/*
 !/g1_slam_ws/src/FAST_LIO_ROS2/Log/.gitkeep
 /g1_slam_ws/src/FAST_LIO_ROS2/PCD/*

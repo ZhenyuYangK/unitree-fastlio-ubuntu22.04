@@ -151,6 +151,7 @@ int main(int argc, char ** argv)
       std::cout << "candidate=" << i << " acceptable=" << candidate.acceptable
                 << " converged=" << candidate.converged
                 << " correlative_score=" << candidate.correlative_score
+                << " quality_score=" << candidate.quality.score
                 << " fitness=" << candidate.fitness << " coverage=" << candidate.quality.coverage
                 << " inlier_rmse=" << candidate.quality.inlier_rmse
                 << " evaluated_points=" << candidate.quality.evaluated_points

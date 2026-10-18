@@ -154,6 +154,24 @@ TEST(GlobalMatcher, RejectsUnrelatedGeometryAndInvalidPoints)
   EXPECT_FALSE(matcher.evaluate(scan, Eigen::Matrix4f::Identity()).acceptable);
 }
 
+TEST(GlobalMatcher, PlausibleModesOutsideInitialOptimizerCountAreRefined)
+{
+  auto map = room();
+  GlobalCloud duplicate;
+  pcl::transformPointCloud(*map, duplicate, pose(14, 0, 0));
+  *map += duplicate;
+  auto options = settings();
+  options.max_x = 20;
+  options.retained_modes = 64;
+  options.ndt_candidates = 2;
+  // Require resolution of more than the initial two modes, under one budget.
+  options.unresolved_score_gap = .8;
+  GlobalMatcher matcher(map, options);
+  const auto result = matcher.search(independentScan(pose(2.1f, -1.2f, -1.07f)));
+  EXPECT_GT(result.candidates.size(), 2u);
+  EXPECT_EQ(result.status, GlobalMatchStatus::AMBIGUOUS) << result.reason;
+}
+
 TEST(GlobalMatcher, CancellationAndBudgetsNeverReturnPartialSuccess)
 {
   auto options = settings();

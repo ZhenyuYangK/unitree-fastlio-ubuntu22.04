@@ -482,8 +482,19 @@ GlobalMatchResult GlobalMatcher::search(
         check();
       };
     ndt.registerVisualizationCallback(ndt_progress);
-    const std::size_t refine_count = std::min<std::size_t>(options.ndt_candidates, modes.size());
-    for (std::size_t i = 0; i < refine_count; ++i) {
+    // Start with the configured count, then refine any remaining mode that
+    // could still challenge the best result. Never discard it merely because
+    // it fell outside the first N optimizer calls. The original deadline holds.
+    std::size_t refine_count = 0;
+    for (std::size_t i = 0; i < modes.size(); ++i) {
+      if (i >= static_cast<std::size_t>(options.ndt_candidates)) {
+        const GlobalMatchCandidate * best = nullptr;
+        for (const auto & prior : result.candidates) {
+          if (prior.acceptable && (!best || prior.quality.score > best->quality.score)) {best = &prior;}
+        }
+        if (modes[i].score < options.min_correlative_score ||
+          (best && modes[i].score < best->correlative_score - options.unresolved_score_gap)) {break;}
+      }
       check();
       GlobalMatchCandidate candidate;
       candidate.correlative_score = modes[i].score;
@@ -510,6 +521,7 @@ GlobalMatchResult GlobalMatcher::search(
           tilt_shift <= radians(options.max_refinement_tilt_deg);
       }
       result.candidates.push_back(candidate);
+      ++refine_count;
     }
     check();
     std::stable_sort(result.candidates.begin(), result.candidates.end(),
@@ -536,7 +548,8 @@ GlobalMatchResult GlobalMatcher::search(
         if (unresolved || competing) {ambiguous = true; break;}
       }
       for (std::size_t i = refine_count; i < modes.size(); ++i) {
-        if (modes[i].score >= best.correlative_score - options.unresolved_score_gap) {
+        if (modes[i].score >= options.min_correlative_score &&
+          modes[i].score >= best.correlative_score - options.unresolved_score_gap) {
           ambiguous = true;
           break;
         }

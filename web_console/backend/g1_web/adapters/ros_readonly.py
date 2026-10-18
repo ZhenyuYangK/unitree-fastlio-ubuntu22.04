@@ -16,9 +16,10 @@ def localization_view(raw, now_ns, receive_age):
         stamp = raw.get(key)
         return type(stamp) is int and stamp > 0 and -0.05 <= (now_ns - stamp) / 1e9 <= limit
 
-    stale = receive_age > 1.0 or not fresh("stamp_ns", 1.0) or not fresh("last_success_stamp_ns", 3.0)
+    status_stale = receive_age > 1.0 or not fresh("stamp_ns", 1.0)
+    stale = status_stale or not fresh("last_success_stamp_ns", 3.0)
     state = raw.get("state")
-    return dict(raw, stale=stale,
+    return dict(raw, stale=stale, status_stale=status_stale,
                 valid=not stale and raw.get("valid") is True and isinstance(state, str)
                 and state in {"LOCALIZED", "TRACKING"})
 

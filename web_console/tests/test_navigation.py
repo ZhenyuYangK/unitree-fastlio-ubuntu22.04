@@ -168,6 +168,29 @@ class NavigationGatewayTests(unittest.TestCase):
         self.assertEqual(self.post('operations',operation='navigation.start',name='custom').status_code,422)
         self.assertEqual(self.client.get('/api/v1/operations/not-a-uuid').status_code,404)
 
+    def test_failed_initialization_keeps_specific_fresh_localization_reason(self):
+        original = self.robot.snapshot
+        async def snapshot():
+            data = await original()
+            data['localization'].update(state='AMBIGUOUS', valid=False, status_stale=False,
+                                        reason='Ranked candidates remain competing after 3 attempts')
+            return data
+        async def failure(record):
+            return 1
+        self.robot.snapshot = snapshot
+        self.manager.runner = failure
+        response = self.post('operations', operation='navigation.start')
+        self.assertEqual(response.status_code, 202, response.text)
+        operation = response.json()['operation_id']
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            state = self.client.get('/api/v1/operations/' + operation).json()
+            if state['state'] == 'FAILED':
+                break
+            time.sleep(.02)
+        self.assertEqual(state['state'], 'FAILED', state)
+        self.assertIn('Ranked candidates remain competing', state['message'])
+
     def test_recovery_and_cli_lock_block_start(self):
         runtime=self.root/'runtime/missions'; runtime.mkdir(parents=True)
         (runtime/'recovery_required.json').write_text('{}')

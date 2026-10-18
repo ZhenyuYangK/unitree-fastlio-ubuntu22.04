@@ -203,6 +203,18 @@ class DomainTests(unittest.TestCase):
                                      ({"state": "LOST"}, 0.0), ({"stamp_ns": True}, 0.0), ({}, 1.1)):
             self.assertFalse(localization_view(dict(valid, **changed), now, receive_age)["valid"])
 
+    def test_fresh_initialization_progress_is_visible_without_a_confirmed_pose(self):
+        now = 10_000_000_000
+        for state in ['COLLECTING', 'VERIFYING_CANDIDATES', 'RETRYING', 'AMBIGUOUS']:
+            raw = dict(state=state, valid=False, stamp_ns=now, last_success_stamp_ns=0,
+                       attempt=2, candidates=[dict(candidate=1, score=.8)])
+            data = localization_view(raw, now, 0.0)
+            self.assertFalse(data['status_stale'])
+            self.assertTrue(data['stale'])
+            self.assertFalse(data['valid'])
+            self.assertEqual(data['candidates'], raw['candidates'])
+            self.assertTrue(localization_view(raw, now, 1.1)['status_stale'])
+
 
 class AsyncMockTests(unittest.IsolatedAsyncioTestCase):
     async def test_immediate_cancel_before_coroutine_first_runs(self):

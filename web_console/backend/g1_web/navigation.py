@@ -135,6 +135,11 @@ class NavigationManager(MappingManager):
             code = await self.runner(record)
             record['exit_code'] = code
             if code:
+                if record['action'] in ('navigation.start', 'navigation.start-manual', 'navigation.continue'):
+                    localization = (await self.robot.snapshot()).get('localization', {})
+                    reason = localization.get('reason') if localization.get('status_stale') is False else ''
+                    if reason:
+                        raise RuntimeError('导航命令未成功：' + str(reason) + '；基础进程可能保留，可设置初始位姿后继续')
                 raise RuntimeError('导航命令未成功；定位基础进程可能保留，请查看日志并人工接续')
             action = record['action']
             data = await self.robot.snapshot()

@@ -418,6 +418,20 @@ class MissionIntegrationTest(unittest.TestCase):
         self.assertFalse(reply.result.gate_closed)
         self.assertFalse(reply.result.goals_terminal)
 
+    def test_single_point_action_uses_the_same_worker_and_confirms_stop(self):
+        _, client, action = self._start_action_server(simulated_worker=True)
+        original = self.missions.read_bytes()
+        accepted = self._future(client.send_goal_async(action.Goal(mission_id='waypoint:point_02')))
+        self.assertTrue(accepted.accepted, self._diagnostics())
+        reply = self._future(accepted.get_result_async())
+        self.assertEqual(reply.result.state, 'SUCCEEDED', self._diagnostics())
+        self.assertTrue(reply.result.gate_closed and reply.result.goals_terminal)
+        self.assertEqual(self.missions.read_bytes(), original)
+        identifier = str(uuid.UUID(bytes=bytes(accepted.goal_id.uuid)))
+        record = json.loads((self.root / 'runtime/missions/actions' / (identifier + '.json')).read_text())
+        self.assertEqual(record['goal_id'], identifier)
+        self.assertEqual(record['mission_id'], 'waypoint:point_02')
+
     def test_action_worker_forwards_station_feedback_release_and_cancellation(self):
         process, client, action = self._start_action_server(simulated_worker=True)
         feedback = []

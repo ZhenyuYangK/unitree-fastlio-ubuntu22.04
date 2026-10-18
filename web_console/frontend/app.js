@@ -362,7 +362,9 @@ function render() {
   const canAcquire = fresh && (data.capabilities.mission_control || data.capabilities.waypoint_write || data.capabilities.mission_write || data.capabilities.mapping_control) && !pending;
   $("modeText").textContent = data.simulated ? "模拟演示 · 未连接真实机器人，地图与反馈均为示例" : local ? "本地数据 · 地图、导航点和任务与后端文件同步，机器人实时状态未连接" : data.mode === 'ros_control' ? 'ROS 控制 · 定位导航、单点导航与巡航任务' : "ROS 只读 · 实时位姿、规划路径、建图和配置编辑";
   document.querySelector(".mode-tag").textContent = data.simulated ? "模拟" : local ? "本地" : "ROS";
-  $("localizationValue").textContent = local ? "未连接机器人" : !fresh || data.localization.stale ? "状态过期" : data.localization.valid ? "定位有效" : "未定位";
+  const localizationStages = {WAITING_DATA:'等待雷达数据',COLLECTING:'采集定位点云',SEARCHING:'全局搜索',VERIFYING:'确认初始位姿',VERIFYING_CANDIDATES:'比较定位候选',RETRYING:'重新采集定位',AMBIGUOUS:'定位仍有歧义',FAILED:'定位失败'};
+  const localizationStage = data.localization.status_stale === false && !data.localization.valid ? localizationStages[data.localization.state] : '';
+  $("localizationValue").textContent = local ? "未连接机器人" : !fresh ? "状态过期" : localizationStage || (data.localization.stale ? "状态过期" : data.localization.valid ? "定位有效" : "未定位");
   $("localizationDetail").textContent = local ? "地图与配置编辑可用" : `${data.localization.state || "UNKNOWN"} · ${data.simulated ? "模拟数据" : "现场数据"}`;
   $("missionValue").textContent = local ? "路线预览" : !fresh || mission.stale ? "状态过期" : phases[mission.state] || mission.state;
   $("missionDetail").textContent = mission.mission_name || "当前无运行任务";

@@ -18,11 +18,14 @@ from test_navigation import fixture
 
 class NavigationFixture(MockAdapter):
     def __init__(self,settings):
-        super().__init__(settings); self.initial=[]
+        super().__init__(settings); self.initial=[]; self.progress=None
     async def snapshot(self):
         data=await super().snapshot()
         data['simulated']=False
         data['capabilities']['initial_pose']=True
+        if self.progress:
+            data['localization'].update(self.progress)
+            data['navigation']['ready']=False
         return data
     async def initial_pose(self,x,y,yaw):
         self.initial.append((x,y,yaw))
@@ -59,6 +62,20 @@ def main():
                 expect(page.locator('#goToButton')).to_be_enabled()
                 page.locator('[data-view="integration"]').first.click()
                 expect(page.locator('#navigationChecks li.is-ready')).to_have_count(7)
+                robot.progress=dict(state='VERIFYING_CANDIDATES',valid=False,status_stale=False,
+                                    attempt=2,max_attempts=3,candidates=[dict(candidate=1,score=.81,stable=True),
+                                                                      dict(candidate=2,score=.78,stable=True)])
+                expect(page.locator('#navigationPhase')).to_have_text('比较定位候选')
+                expect(page.locator('#navigationOperationMessage')).to_contain_text('第 2/3 次')
+                expect(page.locator('#navigationOperationMessage')).to_contain_text('候选 1 81.0 分')
+                page.screenshot(path='/tmp/g1-localization-candidates.png',full_page=True)
+                page.locator('[data-view="overview"]').first.click()
+                expect(page.locator('#localizationValue')).to_have_text('比较定位候选')
+                robot.progress.update(state='RETRYING',candidates=[])
+                expect(page.locator('#localizationValue')).to_have_text('重新采集定位')
+                page.screenshot(path='/tmp/g1-localization-retry.png',full_page=True)
+                page.locator('[data-view="integration"]').first.click()
+                robot.progress=None
                 page.locator('#navigationStart').click()
                 expect(page.locator('#navigationOperation')).to_have_text('已完成')
                 page.locator('#navigationInitial').click()
@@ -105,7 +122,7 @@ def main():
                 expect(page.locator('#connection')).to_have_text('实时连接',timeout=12000)
                 assert not errors,errors
                 browser.close()
-            print('Browser navigation checks passed: preparation, readiness, numeric and map-drag pose preview, single-point confirmation/path/cancel, follow/reset, mobile/dark mode, disconnect controls; no page errors.')
+            print('Browser navigation checks passed: ranked candidate scores, attempt count, retry progress, preparation, readiness, numeric and map-drag pose preview, single-point confirmation/path/cancel, follow/reset, mobile/dark mode, disconnect controls; no page errors.')
         finally:
             server.should_exit=True; thread.join(timeout=10)
 

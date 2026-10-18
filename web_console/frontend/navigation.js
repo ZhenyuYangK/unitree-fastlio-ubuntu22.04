@@ -107,7 +107,10 @@ globalThis.G1NavigationUI = class {
       if (key === 'motion_bridge' && fresh && check?.ready && Number.isFinite(speed)) row.textContent += ` · 上限 ${speed.toFixed(2)} m/s`;
       this.$('navigationChecks').append(row);
     }
-    this.$('navigationPhase').textContent = !fresh ? '状态过期' : lifecycle.busy ? '准备中' : nav.ready ? '导航就绪' : '等待准备';
+    const localization = data.localization || {};
+    const stages = {WAITING_DATA:'等待雷达数据',COLLECTING:'采集定位点云',SEARCHING:'全局搜索',VERIFYING:'确认初始位姿',VERIFYING_CANDIDATES:'比较定位候选',RETRYING:'重新采集定位',AMBIGUOUS:'定位仍有歧义',FAILED:'定位失败'};
+    const stage = localization.status_stale === false && !localization.valid ? stages[localization.state] : '';
+    this.$('navigationPhase').textContent = !fresh ? '状态过期' : stage || (lifecycle.busy ? '准备中' : nav.ready ? '导航就绪' : '等待准备');
     for (const [id,operation] of Object.entries(this.actions)) {
       const permission = operation === 'navigation.start-manual' ? 'can_start' : 'can_' + operation.split('.')[1];
       this.$(id).disabled = !permitted || !lifecycle[permission] || mission.active || nav.active_nav_goal;
@@ -139,7 +142,15 @@ globalThis.G1NavigationUI = class {
     const op = lifecycle.operation;
     const states = {QUEUED:'已接受',RUNNING:'执行中',SUCCEEDED:'已完成',FAILED:'失败',INTERRUPTED:'结果未确认'};
     this.$('navigationOperation').textContent = op ? `${states[op.state] || op.state}` : '暂无操作';
-    this.$('navigationOperationMessage').textContent = op?.message || '从自动定位开始；定位失败后可设置初始位姿并继续。';
+    const attempt = Number.isInteger(localization.attempt) && localization.attempt > 0
+      ? ` · 第 ${localization.attempt}/${localization.max_attempts} 次` : '';
+    const candidates = Array.isArray(localization.candidates) ? localization.candidates : [];
+    const scores = candidates.filter((item) => Number.isFinite(item.score))
+      .map((item) => `候选 ${item.candidate} ${(item.score*100).toFixed(1)} 分${item.stable ? '（稳定）' : ''}`).join('，');
+    const detail = stage ? `${stage}${attempt}${scores ? ' · ' + scores : ''}${['AMBIGUOUS','FAILED'].includes(localization.state) ? '；可设置初始位姿后继续启动' : ''}` : '';
+    this.$('navigationOperationMessage').textContent = fresh && detail
+      ? `${detail}${op?.state === 'FAILED' ? ' · ' + op.message : ''}`
+      : op?.message || '从自动定位开始；定位失败后可设置初始位姿并继续。';
     this.$('navigationProcesses').replaceChildren();
     for (const process of lifecycle.processes || []) { const p = document.createElement('p'); p.textContent = `${process.name} · ${process.state === 'running' ? '运行中' : process.state === 'stopped' ? '已退出' : '归属未确认'}`; this.$('navigationProcesses').append(p); }
     if (!document.querySelector('[data-page="integration"]').hidden && performance.now()-this.logsAt > 3000) this.loadLogs();

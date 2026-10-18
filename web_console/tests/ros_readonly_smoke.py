@@ -9,8 +9,13 @@ import json
 import os
 import threading
 import time
+import struct
+import tempfile
+from pathlib import Path
 
 from g1_web.adapters.ros_readonly import RosReadOnlyAdapter
+from g1_web.mapping import SCRIPT_SOURCE
+from g1_mapping_save import save
 
 
 async def main():
@@ -25,6 +30,8 @@ async def main():
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
     from std_msgs.msg import String
+    from std_srvs.srv import Trigger
+    from sensor_msgs.msg import PointCloud2, PointField
     from g1_task_interfaces.srv import GetMissionState
 
     context = Context()
@@ -36,11 +43,33 @@ async def main():
     qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                      durability=DurabilityPolicy.TRANSIENT_LOCAL)
     publisher = fixture.create_publisher(String, "/g1_relocalization/status", qos)
+    cloud_publisher = fixture.create_publisher(PointCloud2, '/cloud_registered',
+        QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+    temporary = tempfile.TemporaryDirectory(prefix='g1-mapping-save-ros-')
+    output = Path(temporary.name) / 'map.pcd'
+    allow_save = [True]
+
+    def save_map(request, response):
+        response.success = allow_save[0]
+        response.message = 'fixture saved' if allow_save[0] else 'fixture rejected'
+        if allow_save[0]:
+            output.write_bytes(b'FIELDS x y z\nSIZE 4 4 4\nTYPE F F F\nCOUNT 1 1 1\nPOINTS 1\nDATA binary\n' + struct.pack('<fff', 1, 2, 3))
+        return response
+
+    save_service = fixture.create_service(Trigger, '/map_save', save_map)
 
     def publish():
         now = fixture.get_clock().now().nanoseconds
         publisher.publish(String(data=json.dumps({"state": "TRACKING", "valid": True,
                           "stamp_ns": now, "last_success_stamp_ns": now, "fitness": 0.1})))
+        cloud = PointCloud2()
+        cloud.header.frame_id = 'camera_init'
+        cloud.height, cloud.width = 1, 2
+        cloud.fields = [PointField(name=name, offset=index*4, datatype=PointField.FLOAT32, count=1)
+                        for index, name in enumerate(('x', 'y', 'z'))]
+        cloud.point_step, cloud.row_step = 12, 24
+        cloud.data = struct.pack('<ffffff', 1, 2, 3, 4, 5, 6)
+        cloud_publisher.publish(cloud)
 
     def get_state(request, response):
         response.active = response.simulated = True
@@ -62,7 +91,7 @@ async def main():
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             data = await adapter.snapshot()
-            if data["localization"]["valid"] and data["mission"]["run_id"] == "isolated-fixture-run":
+            if data["localization"]["valid"] and data["mission"]["run_id"] == "isolated-fixture-run" and data['mapping_preview']['available']:
                 break
             await asyncio.sleep(0.1)
         else:
@@ -70,21 +99,32 @@ async def main():
         assert not any(data["capabilities"].values())
         assert data["mission"]["gate_closed"] is None and data["mission"]["goals_terminal"] is None
         assert data["pose"] is None and not data["map"]["available"]
+        assert set(data['mapping_preview']['points']) == {(1., 2.), (4., 5.)}
+        await asyncio.to_thread(save, output, 5)
+        allow_save[0] = False
+        try:
+            await asyncio.to_thread(save, output, 5)
+        except RuntimeError as exc:
+            assert '拒绝保存' in str(exc)
+        else:
+            raise AssertionError('Trigger.success=false must not report the old PCD as saved')
         published = {name for name, types in adapter.node.get_publisher_names_and_types_by_node("g1_web_readonly", "/")}
         assert published <= {"/rosout", "/parameter_events"}, published
         timer.cancel()
         fixture.destroy_service(service)
-        await asyncio.sleep(2.5)
+        await asyncio.sleep(3.3)
         stale = await adapter.snapshot()
         assert stale["localization"]["stale"] and not stale["localization"]["valid"]
         assert stale["mission"]["stale"]
-        print("ROS read-only check passed: isolated telemetry/service, no business publishers, stale-data detection, unknown stop confirmation.")
+        assert stale['mapping_preview']['stale']
+        print("ROS checks passed: isolated telemetry, mapping PointCloud2 preview, Trigger save success/rejection, no business publishers, stale-data detection.")
     finally:
         await adapter.close()
         executor.shutdown(timeout_sec=2)
         thread.join(timeout=2)
         fixture.destroy_node()
         context.try_shutdown()
+        temporary.cleanup()
 
 
 if __name__ == "__main__":

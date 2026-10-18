@@ -332,7 +332,8 @@ function renderMap(data, mission, route) {
         transform: `translate(${x} ${y}) scale(${scale})`, "aria-label": `站点 ${number} ${point.name}`, "data-waypoint-id": point.id });
       const label = element("text", { class: "stop-number", x: 0, y: 0 }); label.textContent = String(number).padStart(2, "0");
       const title = element("title", {}); title.textContent = `${point.name} · ${point.id}`;
-      group.append(title, element("rect", { class: "stop-plate", x: -24, y: -22, width: 48, height: 44, rx: 5 }), element("circle", { class: "stop-circle", r: 16 }), label);
+      // Keep the original hit area while halving only the waypoint's visible icon.
+      group.append(title, element("rect", { class: "stop-hit-area", x: -24, y: -22, width: 48, height: 44, rx: 5 }), element("circle", { class: "stop-circle", r: 8 }), label);
       if (editable) {
         group.setAttribute("role", "button"); group.setAttribute("tabindex", "0");
         group.addEventListener("click", (event) => { if (!mapPickingDraft) { event.stopPropagation(); editor.openWaypoint(point); } });

@@ -385,8 +385,6 @@ h1 {
   flex:none;
   inline-size:var(--size);
   block-size:calc(var(--size)*.916667);
-  border-radius:5px;
-  background:var(--navy);
   vertical-align:middle;
 }
 
@@ -625,8 +623,9 @@ h2 {
   stroke-linejoin:round;
 }
 
-.stop-marker-svg .stop-plate {
-  fill:var(--navy);
+.stop-marker-svg .stop-hit-area {
+  fill:transparent;
+  pointer-events:all;
 }
 
 .stop-marker-svg .stop-circle {
@@ -636,7 +635,7 @@ h2 {
 .stop-marker-svg .stop-number {
   fill:var(--marker-ink);
   font-family:var(--stop-font);
-  font-size:24px;
+  font-size:12px;
   font-weight:700;
   text-anchor:middle;
   dominant-baseline:central;

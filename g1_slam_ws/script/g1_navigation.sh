@@ -381,6 +381,27 @@ start_base_stack() {
   rm -f "${LOG_DIR}"/*.log
   generate_runtime_files
 
+  # Keep the effective inputs alongside per-attempt scans and candidate scores.
+  python3 - "${RUNTIME_DIR}/diagnostics/relocalization" "${MAP_PCD}" "${RELOC_CFG}" "${LOCALIZATION_TIMEOUT_SEC}" "${initialization_mode}" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+import time
+
+directory, map_path, config_path, timeout, mode = sys.argv[1:]
+root = Path(directory)
+root.mkdir(parents=True, exist_ok=True)
+inputs = {}
+for name, filename in [('map', map_path), ('config', config_path)]:
+    path = Path(filename)
+    inputs[name] = dict(path=str(path.resolve()), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+inputs.update(initialization_mode=mode, global_search_timeout_sec=float(timeout),
+              global_initialization_timeout_sec=float(timeout),
+              config_yaml=Path(config_path).read_text())
+(root / ('inputs_' + str(time.time_ns()) + '.json')).write_text(json.dumps(inputs, indent=2) + '\n')
+PY
+
   start_process livox ros2 launch livox_ros_driver2 msg_MID360_launch.py \
     user_config_path:="${G1_LIVOX_CONFIG}"
   wait_for_topic /livox/lidar 35 || die "未收到 /livox/lidar"
@@ -404,7 +425,9 @@ start_base_stack() {
       --params-file "${RELOC_CFG}" \
       -p map_path:="${MAP_PCD}" \
       -p initialization_mode:="${initialization_mode}" \
-      -p global_search_timeout_sec:="${LOCALIZATION_TIMEOUT_SEC}"
+      -p global_search_timeout_sec:="${LOCALIZATION_TIMEOUT_SEC}" \
+      -p global_initialization_timeout_sec:="${LOCALIZATION_TIMEOUT_SEC}" \
+      -p diagnostics_directory:="${RUNTIME_DIR}/diagnostics/relocalization"
 
   wait_for_topic /global_pcd_map 30 || die "未发布 /global_pcd_map"
 

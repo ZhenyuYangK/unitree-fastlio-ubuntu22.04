@@ -4,7 +4,7 @@
 
 在项目根目录执行下面的命令。
 
-网页控制的真实地图、导航点/任务编辑、模拟页面和 ROS 状态接口见 [web_console/README.md](web_console/README.md)。机器人运动控制待接入，PC2 的 Foxy 原生版本后续单独适配。
+网页控制的建图管理、真实地图、导航点/任务编辑和 ROS 状态接口见 [web_console/README.md](web_console/README.md)。网页定位、单点导航与巡航控制见 [导航使用说明](web_console/docs/navigation.md)，需要显式 ros_control 模式；PC2 的 Foxy 原生版本后续单独适配。
 
 本轮真机测试反馈及待处理问题见 [KNOWN_ISSUES.md](KNOWN_ISSUES.md)，其中首个导航点语音播放异常和满音量需求仍待讨论处理。
 

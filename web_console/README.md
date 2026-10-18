@@ -2,9 +2,11 @@
 
 面向当前 Ubuntu 22.04 / x86_64 / Humble 开发电脑的需求草案、HTTP/WebSocket 网关和浏览器页面。PC2 的 Ubuntu 20.04 / aarch64 / Foxy 原生版本后续单独适配。
 
-先阅读 [需求与待确认项](docs/requirements.md)，接口见 [API 契约](docs/api.md)。默认直接使用本地工作空间的地图、导航点和任务，支持在页面编辑并保存后端配置。机器人运动控制仍未接入，PC2 原生版本后续单独适配。
+先阅读 [需求与待确认项](docs/requirements.md)，接口见 [API 契约](docs/api.md)。默认直接使用本地工作空间的地图、导航点和任务，支持在页面编辑并保存后端配置。显式 `ros_control` 模式接入导航准备、初始位姿、单点导航及巡航开始/取消/放行；使用流程见 [网页定位与导航](docs/navigation.md)。PC2 原生版本后续单独适配。
 
-机器人已连接时，按 [现场完整验证方案](docs/real_robot_validation.md) 分阶段验证：定位/状态、网页配置同步、ROS 模拟联调、限速单点、语音、取消和五点巡航。该文档记录了本轮已通过的只读通信基线，并区分尚未实现的网页真机控制。
+机器人已连接时，按 [现场完整验证方案](docs/real_robot_validation.md) 分阶段验证：定位/状态、网页配置同步、ROS 模拟联调、限速单点、语音、取消和五点巡航。该文档区分已有只读通信基线、合成导航测试与尚待现场验收的真实运动。
+
+网页建图入口、成果路径与异常处理见 [建图使用说明](docs/mapping.md)。已接入启动、保存、保存并结束、停止、点云俯视预览和 PCD 下载。
 
 ## 本地地图与配置
 
@@ -17,7 +19,7 @@
 - 保存复用现有 YAML 校验器，校验导航点引用、map_id 和讲解配置；与 CLI 共用文件锁，任务运行或有恢复标记时拒绝修改。
 - 保留公共导视牌风格、浅/深色主题、手机布局、键盘焦点和减少动态效果支持。
 
-地图连线表示任务的站点顺序。机器人位置、TF 和 Nav2 规划路径尚未接入；local 模式明确显示机器人实时状态未连接。地图像素本身不在网页编辑范围内。
+地图虚线表示任务的站点顺序，绿色实线表示新鲜的 Nav2 规划路径。ROS 模式接入 map→nav_base 位姿和朝向，local 模式明确显示机器人实时状态未连接。地图像素本身不在网页编辑范围内。
 
 ## 本机启动
 
@@ -29,7 +31,7 @@ web_console/.venv/bin/python -m pip install -r web_console/requirements.txt
 bash web_console/run.sh
 ```
 
-浏览器打开 **http://127.0.0.1:8080**。默认 `G1_WEB_MODE=local`，无需启动 ROS。点击“取得编辑权”，然后在导航点、巡航任务页或地图标记中编辑，点击“保存到后端”写入文件。该模式不会启动机器人业务节点。
+浏览器打开 **http://127.0.0.1:8080**。默认 `G1_WEB_MODE=local`，无需启动 ROS。点击“取得操作权”，然后在导航点、巡航任务页或地图标记中编辑，点击“保存到后端”写入文件。启动网关本身不会自动启动机器人业务节点；建图页的显式操作可以启动雷达和 FAST-LIO。
 
 若创建虚拟环境提示 ensurepip 不可用，需要先安装系统 python3-venv 包。使用 system-site-packages 是为了在之后的 Humble 模式访问系统 rclpy。
 
@@ -54,7 +56,7 @@ export G1_WEB_HOST=0.0.0.0
 bash web_console/run.sh
 ```
 
-其他设备访问 `http://控制电脑的可达局域网IP:8080` 并输入口令；同一时间一个设备持有编辑权，其他设备可查看。页面按当前域名构造 API/WS 地址。
+其他设备访问 `http://控制电脑的可达局域网IP:8080` 并输入口令；同一时间一个设备持有操作权，其他设备可查看。页面按当前域名构造 API/WS 地址。
 
 需要独立体验五站模拟任务时显式启动：
 
@@ -74,7 +76,7 @@ export G1_WEB_TOKEN
 G1_WEB_MODE=ros_readonly bash web_console/run.sh
 ```
 
-启动器加载本项目的 Humble 工作空间。已有定位节点和任务执行器独立运行；网关不启动 Nav2、不调用任务执行、不启用运动桥。地图、导航点与任务文件同样使用以上本地数据源。此模式的“只读”指机器人 ROS 通道，配置文件仍可在页面编辑。
+启动器加载本项目的 Humble 工作空间。已有定位节点和任务执行器独立运行；网关不启动 Nav2、不调用任务执行、不启用运动桥；建图页可显式管理雷达和 FAST-LIO。地图、导航点与任务文件同样使用以上本地数据源。此模式的“只读”指机器人运动/任务通道；配置文件可编辑，建图生命周期可操作。
 
 此模式展示现场地图，不展示演示位置；定位/任务断流显示过期。任务空闲时 GetMissionState 服务可能不存在，因此显示状态未知，不推断已停止。
 
@@ -129,7 +131,7 @@ source unitree_ros2/setup.sh
 PYTHONPATH="web_console/backend:$PYTHONPATH" web_console/.venv/bin/python web_console/tests/ros_readonly_smoke.py
 ```
 
-该测试自行固定 CycloneDDS 到回环接口，并检查定位/任务接收、状态断流和没有业务发布者。
+该测试自行固定 CycloneDDS 到回环接口，并检查定位/任务/建图点云接收、地图保存服务成功与拒绝、状态断流和适配器没有业务发布者。
 
 ## 代码结构
 
@@ -140,6 +142,8 @@ web_console/
 │   ├── app.py               同源接口、认证、命令去重、状态快照
 │   ├── control.py           单设备租约与错误模型
 │   ├── config.py            模式与环境配置
+│   ├── mapping.py           建图操作、持久结果、日志与下载
+│   ├── cloud.py             有界点云俯视采样
 │   ├── workspace.py         地图与配置读写、锁、版本、备份
 │   └── adapters/
 │       ├── base.py          后端能力边界
@@ -151,4 +155,4 @@ web_console/
 └── run.sh                   单进程启动入口
 ```
 
-后续真实控制适配器继续使用现有 ExecuteMission、GetMissionState、ContinueMission 接口，并保留已有就绪检查和停止恢复流程。当前 mode 接受 local / mock / ros_readonly，不能通过参数切换成真实运动执行。
+真实控制适配器使用现有 ExecuteMission、GetMissionState、ContinueMission 接口，并保留已有就绪检查和停止恢复流程。当前 mode 接受 local / mock / ros_readonly / ros_control；仅 ros_control 接入真实导航操作，必须设置访问口令。启动网关本身不自动启动机器人业务节点；导航控制详见 [使用说明](docs/navigation.md)。

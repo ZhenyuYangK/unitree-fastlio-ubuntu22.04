@@ -25,6 +25,7 @@ LOG_DIR="${RUNTIME_DIR}/logs"
 PID_FILE="${RUNTIME_DIR}/mapping.pids"
 SESSION_FILE="${RUNTIME_DIR}/session.env"
 RUNTIME_CFG="${RUNTIME_DIR}/mid360_mapping.yaml"
+STATE_HELPER="${SCRIPT_DIR}/g1_mapping_state.py"
 
 mkdir -p "${LOG_DIR}"
 
@@ -49,8 +50,10 @@ check_prerequisites() {
   check_package livox_ros_driver2
   check_package fast_lio
 
-  if timeout 4 ros2 node list --no-daemon --spin-time 1 2>/dev/null | grep -Eq '/(controller_server|planner_server|g1_relocalization|map_server)$'; then
-    die "检测到定位或导航系统仍在运行，请先执行 g1_navigation.sh stop"
+  local nodes
+  nodes="$(timeout 8 ros2 node list --no-daemon --spin-time 1)" || die "无法核对导航节点，未启动建图"
+  if grep -Eq '/(controller_server|planner_server|g1_relocalization|map_server|g1_cmd_vel_dry_run)$' <<<"$nodes"; then
+    die "检测到定位、导航或运动桥仍在运行，请先按原管理方式结束这些进程"
   fi
 }
 
@@ -61,34 +64,56 @@ start_process() {
   shift
   local log_file="${LOG_DIR}/${name}.log"
 
-  setsid "$@" >"${log_file}" 2>&1 < /dev/null &
+  setsid "$@" >"${log_file}" 2>&1 < /dev/null 9>&- 8>&- &
   local pid=$!
-  printf '%s %s\n' "${name}" "${pid}" >>"${PID_FILE}"
+  local token
+  token="$(python3 "$STATE_HELPER" token "$pid")" || die "$name 启动后立即退出，请查看日志"
+  printf '%s %s %s\n' "${name}" "${pid}" "$token" >>"${PID_FILE}"
   say "已启动 ${name}，PID=${pid}，日志=${log_file}"
+}
+
+group_running() {
+  python3 "$STATE_HELPER" check "$1" "${2:-}" >/dev/null 2>&1
 }
 
 stop_from_pid_file() {
   [[ -f "${PID_FILE}" ]] || return 0
-
-  tac "${PID_FILE}" | while read -r name pid; do
-    [[ -n "${pid:-}" ]] || continue
-    if pid_alive "${pid}"; then
+  local records name pid token state attempt remaining
+  records="$(python3 "$STATE_HELPER" processes "$PID_FILE")" || die "PID 记录不可用，未发送停止信号"
+  python3 -c 'import json,sys; sys.exit(any(p["state"] == "unverified" for p in json.loads(sys.argv[1])))' "$records" \
+    || die "存在无法确认归属的旧 PID 记录，未发送停止信号；请核对实际进程后按原会话处理"
+  while read -r name pid token; do
+    if group_running "$pid" "$token"; then
       say "停止 ${name}，PID=${pid}"
-      kill -INT -- "-${pid}" 2>/dev/null || kill -INT "${pid}" 2>/dev/null || true
+      kill -INT -- "-${pid}" 2>/dev/null || true
     fi
+  done < <(tac "$PID_FILE")
+  for attempt in {1..12}; do
+    remaining=0
+    while read -r name pid token; do
+      if group_running "$pid" "$token"; then remaining=1; fi
+    done < "$PID_FILE"
+    (( remaining )) || break
+    sleep 0.5
   done
-
-  sleep 3
-
-  tac "${PID_FILE}" | while read -r name pid; do
-    [[ -n "${pid:-}" ]] || continue
-    if pid_alive "${pid}"; then
-      warn "${name} 未正常退出，发送 TERM"
-      kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+  while read -r name pid token; do
+    if group_running "$pid" "$token"; then
+      warn "$name 尚未退出，发送 TERM"
+      kill -TERM -- "-${pid}" 2>/dev/null || true
     fi
+  done < <(tac "$PID_FILE")
+  for attempt in {1..10}; do
+    remaining=0
+    while read -r name pid token; do
+      if group_running "$pid" "$token"; then remaining=1; fi
+    done < "$PID_FILE"
+    (( remaining )) || break
+    sleep 0.5
   done
-
-  rm -f "${PID_FILE}"
+  records="$(python3 "$STATE_HELPER" processes "$PID_FILE")" || die "无法确认进程退出，PID 记录保留"
+  python3 -c 'import json,sys; sys.exit(any(p["state"] != "stopped" for p in json.loads(sys.argv[1])))' "$records" \
+    || die "建图进程退出尚未确认，PID 记录保留"
+  rm -f "$PID_FILE"
 }
 
 
@@ -98,7 +123,7 @@ wait_for_topic() {
   local elapsed=0
 
   while (( elapsed < timeout_sec )); do
-    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq "${topic}"; then
+    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fx "${topic}" >/dev/null; then
       ok "话题已出现：${topic}"
       return 0
     fi
@@ -115,7 +140,7 @@ wait_for_service() {
   local elapsed=0
 
   while (( elapsed < timeout_sec )); do
-    if timeout 4 ros2 service list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq "${service}"; then
+    if timeout 4 ros2 service list --no-daemon --spin-time 1 2>/dev/null | grep -Fx "${service}" >/dev/null; then
       ok "服务已出现：${service}"
       return 0
     fi
@@ -174,6 +199,14 @@ PY
   printf 'MAP_OUTPUT=%q\nRUNTIME_CONFIG=%q\nSTART_TIME=%q\n' \
     "${output_path}" "${RUNTIME_CFG}" "${stamp}" >"${SESSION_FILE}"
 
+  python3 - "$RUNTIME_DIR/session.json" "$output_path" "$stamp" <<'JSON_SESSION'
+import json, os, pathlib, sys, uuid
+path = pathlib.Path(sys.argv[1])
+value = {"id": os.environ.get("G1_MAPPING_SESSION_ID") or str(uuid.uuid4()), "output": sys.argv[2], "started_at": sys.argv[3]}
+path.with_suffix('.tmp').write_text(json.dumps(value, ensure_ascii=False))
+path.with_suffix('.tmp').replace(path)
+JSON_SESSION
+
   ok "本次地图输出：${output_path}"
   ok "运行配置：${RUNTIME_CFG}"
 }
@@ -185,6 +218,10 @@ load_session() {
 }
 
 start_all() {
+  local records
+  records="$(python3 "$STATE_HELPER" processes "$PID_FILE")" || die "无法核对已有建图进程"
+  python3 -c 'import json,sys; sys.exit(any(p["state"] != "stopped" for p in json.loads(sys.argv[1])))' "$records" \
+    || die "已有建图进程或未确认的 PID，请先结束原会话"
   check_prerequisites
   stop_from_pid_file
 
@@ -229,11 +266,8 @@ save_map() {
   wait_for_service /map_save 8 || die "/map_save 不存在，建图节点可能未运行"
 
   say "正在保存地图到 ${MAP_OUTPUT}"
-  timeout 120 ros2 service call /map_save std_srvs/srv/Trigger "{}" \
-    || die "调用 /map_save 失败"
-
-  sleep 2
-  [[ -s "${MAP_OUTPUT}" ]] || die "服务返回后仍未生成有效文件：${MAP_OUTPUT}"
+  python3 "$SCRIPT_DIR/g1_mapping_save.py" --output "$MAP_OUTPUT" \
+    || die "地图保存未确认，建图进程保留"
 
   ok "地图保存成功"
   ls -lh "${MAP_OUTPUT}"
@@ -268,27 +302,28 @@ show_status() {
 
   if [[ -f "${PID_FILE}" ]]; then
     printf '%-14s %-10s %s\n' "进程" "PID" "状态"
-    while read -r name pid; do
-      if pid_alive "${pid}"; then
-        printf '%-14s %-10s %s\n' "${name}" "${pid}" "运行中"
-      else
-        printf '%-14s %-10s %s\n' "${name}" "${pid}" "已退出"
-      fi
-    done <"${PID_FILE}"
+    local records
+    records="$(python3 "$STATE_HELPER" processes "$PID_FILE")" || die "无法核对 PID 记录"
+    python3 - "$records" <<'STATUS_JSON'
+import json, sys
+labels = {'running': '运行中', 'stopped': '已退出', 'unverified': '归属未确认'}
+for item in json.loads(sys.argv[1]):
+    print('{:<14} {:<10} {}'.format(item['name'], item['pid'], labels[item['state']]))
+STATUS_JSON
   else
     warn "没有 PID 文件"
   fi
 
   echo
   for topic in /livox/lidar /livox/imu /Odometry /cloud_registered /cloud_registered_body; do
-    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq "${topic}"; then
+    if timeout 4 ros2 topic list --no-daemon --spin-time 1 2>/dev/null | grep -Fx "${topic}" >/dev/null; then
       printf '[OK]   %s\n' "${topic}"
     else
       printf '[MISS] %s\n' "${topic}"
     fi
   done
 
-  if timeout 4 ros2 service list --no-daemon --spin-time 1 2>/dev/null | grep -Fxq /map_save; then
+  if timeout 4 ros2 service list --no-daemon --spin-time 1 2>/dev/null | grep -Fx /map_save >/dev/null; then
     printf '[OK]   /map_save\n'
   else
     printf '[MISS] /map_save\n'
@@ -321,6 +356,18 @@ EOF_USAGE
 }
 
 main() {
+  case "${1:-start}" in
+    start|save|finish|stop|restart)
+      exec 9>"$WS/runtime/stack_lifecycle.lock"
+      flock -n 9 || die "另一个建图/导航操作正在执行"
+      mkdir -p "$WS/runtime/missions"
+      exec 8>"$WS/runtime/missions/mission.lock"
+      flock -n 8 || die "任务运行中，不能操作建图"
+      ;;
+  esac
+  case "${1:-start}" in
+    start|restart) [[ ! -f "$WS/runtime/missions/recovery_required.json" ]] || die "存在停止未确认的任务，不能启动建图" ;;
+  esac
   case "${1:-start}" in
     start) start_all ;;
     save) save_map ;;

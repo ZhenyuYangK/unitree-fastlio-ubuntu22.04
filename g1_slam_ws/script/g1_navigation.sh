@@ -62,7 +62,7 @@ pid_alive() { kill -0 "$1" 2>/dev/null; }
 check_mapping_not_running() {
   local mapping_pid_file="${WS}/runtime/mapping/mapping.pids"
   if [[ -f "${mapping_pid_file}" ]]; then
-    while read -r _name pid; do
+    while read -r _name pid _token; do
       if [[ -n "${pid:-}" ]] && pid_alive "${pid}"; then
         die "建图系统仍在运行，请先执行 ${SCRIPT_DIR}/g1_mapping.sh stop"
       fi
@@ -111,33 +111,47 @@ start_process() {
   shift
   local log_file="${LOG_DIR}/${name}.log"
 
-  setsid "$@" >"${log_file}" 2>&1 < /dev/null &
+  setsid "$@" >"${log_file}" 2>&1 < /dev/null 9>&- &
   local pid=$!
-  printf '%s %s\n' "${name}" "${pid}" >>"${PID_FILE}"
+  local token
+  token="$(python3 "${SCRIPT_DIR}/g1_mapping_state.py" token "$pid")" || die "无法确认导航进程身份"
+  printf '%s %s %s\n' "${name}" "${pid}" "$token" >>"${PID_FILE}"
   say "已启动 ${name}，PID=${pid}，日志=${log_file}"
 }
 
 stop_from_pid_file() {
   [[ -f "${PID_FILE}" ]] || return 0
-
-  tac "${PID_FILE}" | while read -r name pid; do
-    [[ -n "${pid:-}" ]] || continue
-    if pid_alive "${pid}"; then
+  local name pid token state
+  while read -r name pid token; do
+    if python3 "${SCRIPT_DIR}/g1_mapping_state.py" check "$pid" ${token:+"$token"}; then
+      :
+    else
+      state=$?
+      [[ "$state" == 1 ]] || die "进程 ${name} 身份未确认，保留 PID 记录"
+    fi
+  done <"${PID_FILE}"
+  while read -r name pid token; do
+    if python3 "${SCRIPT_DIR}/g1_mapping_state.py" check "$pid" ${token:+"$token"}; then
       say "停止 ${name}，PID=${pid}"
       kill -INT -- "-${pid}" 2>/dev/null || kill -INT "${pid}" 2>/dev/null || true
     fi
-  done
-
+  done < <(tac "${PID_FILE}")
   sleep 3
-
-  tac "${PID_FILE}" | while read -r name pid; do
-    [[ -n "${pid:-}" ]] || continue
-    if pid_alive "${pid}"; then
+  while read -r name pid token; do
+    if python3 "${SCRIPT_DIR}/g1_mapping_state.py" check "$pid" ${token:+"$token"}; then
       warn "${name} 未正常退出，发送 TERM"
       kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
     fi
-  done
-
+  done < <(tac "${PID_FILE}")
+  sleep 1
+  while read -r name pid token; do
+    if python3 "${SCRIPT_DIR}/g1_mapping_state.py" check "$pid" ${token:+"$token"}; then
+      die "${name} 仍在运行，停止未确认，PID 记录保留"
+    else
+      state=$?
+      [[ "$state" == 1 ]] || die "${name} 退出状态未确认，PID 记录保留"
+    fi
+  done <"${PID_FILE}"
   rm -f "${PID_FILE}"
 }
 
@@ -574,7 +588,7 @@ show_status() {
 
   if [[ -f "${PID_FILE}" ]]; then
     printf '%-18s %-10s %s\n' "进程" "PID" "状态"
-    while read -r name pid; do
+    while read -r name pid token; do
       if pid_alive "${pid}"; then
         printf '%-18s %-10s %s\n' "${name}" "${pid}" "运行中"
       else
@@ -660,6 +674,13 @@ EOF_USAGE
 }
 
 main() {
+  case "${1:-start}" in
+    start*|continue*|restart|stop)
+      mkdir -p "$WS/runtime"
+      exec 9>"$WS/runtime/stack_lifecycle.lock"
+      flock -n 9 || die "另一个建图/导航操作正在执行"
+      ;;
+  esac
   case "${1:-start}" in
     start) start_sequence manual no ;;
     start-dry) start_sequence manual yes ;;

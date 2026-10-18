@@ -212,7 +212,11 @@ start_bridge()
         >"$LOG_FILE" 2>&1 </dev/null 9>&- &
 
     pid=$!
-    echo "$pid" > "$PID_FILE"
+    if ! token="$(process_token "$pid")"; then
+        stop_audio_bridge
+        return 1
+    fi
+    printf '%s %s\n' "$pid" "$token" > "$PID_FILE"
 
     sleep 3
 
@@ -267,12 +271,26 @@ stop_bridge()
     if load_env; then disable_bridge || true; fi
 
     if [[ -f "$PID_FILE" ]]; then
-        pid="$(cat "$PID_FILE")"
-
-        if kill -0 "$pid" 2>/dev/null; then
+        local token current attempt
+        read -r pid token < "$PID_FILE" || true
+        current="$(process_token "$pid" || true)"
+        if [[ -n "$current" && ( -z "${token:-}" || "$current" != "$token" ) ]]; then
+            echo "[ERROR] 真机桥进程身份未确认，PID 记录保留"
+            return 1
+        fi
+        if [[ -n "$current" ]]; then
             kill -INT -- "-$pid" 2>/dev/null ||
                 kill -INT "$pid" 2>/dev/null ||
                 true
+            for attempt in {1..40}; do
+                current="$(process_token "$pid" || true)"
+                [[ "$current" == "$token" ]] || break
+                sleep 0.1
+            done
+            if [[ "$current" == "$token" ]]; then
+                echo "[ERROR] 真机桥退出未确认，PID 记录保留"
+                return 1
+            fi
         fi
 
         rm -f "$PID_FILE"

@@ -7,13 +7,13 @@ function randomId() {
   const hex = [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
-const titles = { overview: "运行总览", waypoints: "导航点", missions: "巡航任务", integration: "系统接入" };
+const titles = { overview: "运行总览", waypoints: "导航点", missions: "巡航任务", mapping: "建图管理", integration: "系统接入" };
 const phases = { IDLE: "待命", UNKNOWN: "未知", STARTING: "准备中", NAVIGATING: "前往站点", SPEAKING_ZH: "中文讲解", SPEAKING_EN: "英文讲解", WAITING_FOR_CONTINUE: "等待放行", CONTINUING: "准备继续", CANCELING: "正在取消", CANCELED: "已取消", COMPLETED: "已完成", FAILED: "失败" };
 Object.assign(phases, { CHECKING: "就绪检查", ARRIVED: "已到站", DWELLING: "站点停留", CLEANING_UP: "收尾中", SUCCEEDED: "已完成", CHECKED: "校验完成", ABORTED: "已中止", STOP_UNCONFIRMED: "停止未确认" });
 let snapshot = null, catalog = null, socket = null, lastReceived = 0, connected = false;
 let pending = false, leaseId = sessionStorage.getItem("g1_control_lease") || "";
 let haveLease = false, retryTimer = null, retryDelay = 1000, instanceId = null, sequence = -1;
-let toastTimer = null, editor = null, mapMetadata = null, mapView = null, mapPickingDraft = null;
+let toastTimer = null, editor = null, mappingUI = null, navigationUI = null, mapMetadata = null, mapView = null, mapPickingDraft = null;
 let catalogLoading = false, mapLoading = false;
 let catalogRetryAt = 0, mapRetryAt = 0;
 const deviceName = sessionStorage.getItem("g1_device_name") || `浏览器 ${randomId().slice(0, 4)}`;
@@ -232,7 +232,9 @@ function stopMarker(number, complete = false, large = false) {
 }
 
 function routeView(mission) {
-  const selected = catalog?.missions.find((item) => item.id === (mission.active ? mission.mission_id : $("missionSelect").value));
+  const single = mission.mission_id?.startsWith('waypoint:');
+  const selected = single && mission.active ? {id:mission.mission_id, name:mission.mission_name, waypoints:[mission.mission_id.slice(9)]}
+    : catalog?.missions.find((item) => item.id === (mission.active ? mission.mission_id : $("missionSelect").value));
   const points = (selected?.waypoints || []).map((id) => catalog.waypoints.find((point) => point.id === id)).filter(Boolean);
   const matches = Boolean(mission.run_id && selected?.id === mission.mission_id);
   const step = matches ? Math.min(mission.current_step, points.length) : 0;
@@ -242,6 +244,7 @@ function routeView(mission) {
 }
 
 function renderWayfinding(data, mission, fresh) {
+  $("bannerStopMarker").hidden = false;
   const route = routeView(mission), point = route.points[route.index];
   const emergency = data.emergency_stop?.active === true;
   $("signBanner").classList.toggle("emergency-active", emergency);
@@ -288,6 +291,7 @@ function renderWayfinding(data, mission, fresh) {
 }
 
 function renderMap(data, mission, route) {
+  const fresh = connected && performance.now() - lastReceived < 2000;
   const demo = data.simulated && catalog?.simulated;
   const available = Boolean(data.map.available && (demo || mapMetadata));
   $("map").toggleAttribute("hidden", !available); $("mapEmpty").hidden = available;
@@ -296,11 +300,14 @@ function renderMap(data, mission, route) {
   $("mapMode").textContent = demo ? "示意地图" : available ? "后端地图" : "地图不可用";
   $("mapCaption").textContent = demo ? "示意地图 / 单位：米" : available ? `${mapMetadata.image_name} · ${mapMetadata.resolution} 米/像素` : "等待后端地图";
   $("mapEmpty").textContent = data.map.error || "正在加载后端地图…";
-  $("poseValue").textContent = data.pose ? `X ${data.pose.x.toFixed(2)} / Y ${data.pose.y.toFixed(2)}` : "机器人位置未连接";
+  $("poseValue").textContent = !fresh ? '位置数据已过期' : data.pose ? `X ${data.pose.x.toFixed(2)} / Y ${data.pose.y.toFixed(2)}` : "机器人位置未连接";
   for (const id of ["mapZoomIn", "mapZoomOut", "mapFit"]) $(id).disabled = !available || demo;
   $("map").classList.toggle("is-picking", Boolean(mapPickingDraft));
   $("mapPickHint").hidden = !mapPickingDraft;
   if (!available) return;
+  if (navigationUI?.follow && data.pose && fresh && mapMetadata && !demo) {
+    const [x,y] = svgPoint(data.pose); mapView = [x-mapView[2]/2,y-mapView[3]/2,mapView[2],mapView[3]];
+  }
   const box = demo ? [0, 0, 860, 570] : mapView;
   $("map").setAttribute("viewBox", box.join(" "));
   $("map").setAttribute("aria-label", demo ? "模拟实验室地图" : "后端实验室地图，标注导航点和任务站点顺序");
@@ -334,11 +341,12 @@ function renderMap(data, mission, route) {
       $("waypointLayer").append(group);
     });
   }
-  $("robotMarker").toggleAttribute("hidden", !data.pose);
+  $("robotMarker").toggleAttribute("hidden", !data.pose || !fresh);
   if (data.pose) {
     const [x, y] = svgPoint(data.pose), originYaw = demo ? 0 : mapMetadata.origin[2];
     $("robotMarker").style.transform = `translate(${x}px, ${y}px) rotate(${-(data.pose.yaw - originYaw) * 180 / Math.PI}deg) scale(${scale})`;
   }
+  navigationUI?.draw(data, svgPoint, scale, fresh);
 }
 
 function render() {
@@ -350,8 +358,8 @@ function render() {
   const data = snapshot.data, mission = data.mission, control = data.control;
   const canControl = fresh && haveLease && control.held && data.capabilities.mission_control && !pending;
   const local = data.mode === "local";
-  const canAcquire = fresh && (data.capabilities.mission_control || data.capabilities.waypoint_write || data.capabilities.mission_write) && !pending;
-  $("modeText").textContent = data.simulated ? "模拟演示 · 未连接真实机器人，地图与反馈均为示例" : local ? "本地数据 · 地图、导航点和任务与后端文件同步，机器人实时状态未连接" : "ROS 状态 · 展示现场状态，支持编辑后端配置";
+  const canAcquire = fresh && (data.capabilities.mission_control || data.capabilities.waypoint_write || data.capabilities.mission_write || data.capabilities.mapping_control) && !pending;
+  $("modeText").textContent = data.simulated ? "模拟演示 · 未连接真实机器人，地图与反馈均为示例" : local ? "本地数据 · 地图、导航点和任务与后端文件同步，机器人实时状态未连接" : data.mode === 'ros_control' ? 'ROS 控制 · 定位导航、单点导航与巡航任务' : "ROS 只读 · 实时位姿、规划路径、建图和配置编辑";
   document.querySelector(".mode-tag").textContent = data.simulated ? "模拟" : local ? "本地" : "ROS";
   $("localizationValue").textContent = local ? "未连接机器人" : !fresh || data.localization.stale ? "状态过期" : data.localization.valid ? "定位有效" : "未定位";
   $("localizationDetail").textContent = local ? "地图与配置编辑可用" : `${data.localization.state || "UNKNOWN"} · ${data.simulated ? "模拟数据" : "现场数据"}`;
@@ -361,8 +369,8 @@ function render() {
   $("stepDetail").textContent = mission.current_waypoint || "等待任务开始";
   $("controlValue").textContent = !fresh ? "状态过期" : haveLease && control.held ? "本设备控制" : control.held ? control.owner : "暂无控制设备";
   $("controlDetail").textContent = control.held ? `租约剩余 ${control.remaining_sec.toFixed(0)} 秒` : "查看状态无需取得控制权";
-  $("controlMetricLabel").textContent = data.simulated ? "控制设备" : "编辑设备";
-  $("controlButton").textContent = data.simulated ? haveLease ? "释放控制权" : "取得控制权" : haveLease ? "释放编辑权" : "取得编辑权";
+  $("controlMetricLabel").textContent = data.simulated ? "控制设备" : "操作设备";
+  $("controlButton").textContent = data.simulated ? haveLease ? "释放控制权" : "取得控制权" : haveLease ? "释放操作权" : "取得操作权";
   $("controlButton").disabled = !canAcquire || (control.held && !haveLease);
   $("missionSelect").disabled = mission.active || !catalog?.missions.length;
   const selected = catalog?.missions.find((item) => item.id === $("missionSelect").value);
@@ -377,14 +385,18 @@ function render() {
   $("progressMessage").textContent = mission.message || (data.simulated ? "取得控制权后，可以开始模拟巡航。" : "等待现场任务状态。");
   $("runId").textContent = mission.run_id ? `${mission.run_id.slice(0, 12)}…` : "—";
   $("runId").title = mission.run_id;
-  $("startButton").disabled = !canControl || mission.active || !selected;
-  $("startButton").textContent = data.simulated ? "开始模拟巡航 ↗" : "真机控制待接入";
+  $("taskReport").hidden = !fresh || !mission.report_url || mission.active;
+  if (mission.report_url) $("taskReport").href = mission.report_url;
+  const requiresAudio = selected?.steps?.some((step) => step.speech);
+  const navigationReady = data.simulated || (data.navigation?.ready && !data.navigation?.lifecycle?.busy && !data.mapping?.active && !data.mapping?.busy && !data.configuration?.write_blocker && (!requiresAudio || data.navigation.checks?.audio_bridge?.ready));
+  $("startButton").disabled = !canControl || mission.active || !selected || !navigationReady;
+  $("startButton").textContent = data.simulated ? "开始模拟巡航 ↗" : data.capabilities.mission_control ? '开始巡航 ↗' : "真机控制未启用";
   $("startButton").hidden = mission.active;
   $("continueButton").hidden = !mission.active;
-  $("continueButton").disabled = !canControl || mission.state !== "WAITING_FOR_CONTINUE" || !mission.wait_id;
+  $("continueButton").disabled = !canControl || mission.controllable === false || mission.stale || mission.state !== "WAITING_FOR_CONTINUE" || !mission.wait_id;
   $("continueButton").textContent = mission.current_step === mission.total_steps ? "放行并完成任务 →" : "继续下一站 →";
-  $("cancelButton").disabled = !canControl || !mission.active || mission.state === "CANCELING";
-  $("controlNote").textContent = data.simulated ? "演示任务在浏览器断线或控制权到期后继续，等待站点放行。" : "取得编辑权后可修改导航点、路线和讲解。保存写入后端文件并备份。";
+  $("cancelButton").disabled = !canControl || mission.controllable === false || !mission.active || mission.state === "CANCELING";
+  $("controlNote").textContent = data.capabilities.mission_control ? '自主任务在页面断线后继续，人工等待阶段持续等待放行；取消后以收尾结果为准。' : "取得操作权后可修改导航点、路线和讲解。";
   $("snapshotTime").textContent = `快照 ${new Date(snapshot.server_time * 1000).toLocaleTimeString("zh-CN", { hour12: false })} · #${snapshot.sequence}`;
   const route = renderWayfinding(data, mission, fresh);
   if (local && fresh) {
@@ -398,7 +410,9 @@ function render() {
     || (catalog?.revision === config?.revision ? `后端配置已同步 · ${catalog?.waypoints.length || 0} 个导航点` : "正在同步后端配置…");
   $("dataSyncStatus").title = catalog?.files ? Object.values(catalog.files).join("\n") : "";
   editor?.refreshControls(canEdit());
+  navigationUI?.render(data, fresh && haveLease && control.held && !pending, fresh);
   renderMap(data, mission, route);
+  mappingUI?.render(data, fresh && haveLease && control.held && !pending, fresh);
   const logKey = JSON.stringify(data.logs);
   if ($("logList").dataset.key !== logKey) {
     $("logList").dataset.key = logKey; $("logList").replaceChildren();
@@ -430,9 +444,9 @@ async function sendCommand(path, body) {
   const result = await api(path, { method: "POST", control: true, body: { request_id: randomId(), ...body } });
   toast(result.message);
 }
-$("startButton").addEventListener("click", () => withPending(() => sendCommand("/missions/start", { mission_id: $("missionSelect").value })));
+$("startButton").addEventListener("click", () => withPending(() => sendCommand("/missions/start", { mission_id: $("missionSelect").value, revision:catalog?.revision || '' })));
 $("continueButton").addEventListener("click", () => withPending(() => sendCommand("/missions/continue", { run_id: snapshot.data.mission.run_id, wait_id: snapshot.data.mission.wait_id })));
-$("cancelButton").addEventListener("click", () => withPending(() => sendCommand("/missions/cancel", { run_id: snapshot.data.mission.run_id })));
+$("cancelButton").addEventListener("click", () => withPending(() => sendCommand("/missions/cancel", { run_id: snapshot.data.mission.run_id || snapshot.data.mission.goal_id })));
 $("missionSelect").addEventListener("change", render);
 
 async function renew() {
@@ -450,12 +464,15 @@ async function initialize() {
   await renew();
   connect();
 }
+mappingUI = new G1MappingUI({ api, randomId, notify: toast, pending: withPending });
+navigationUI = new G1NavigationUI({api, randomId, notify:toast, pending:withPending, render, view,
+  map:() => mapMetadata, catalog:() => catalog, cancelEditorPick:() => { mapPickingDraft = null; }});
 editor = new G1DataEditor({
   catalog: () => catalog, api, render, canEdit,
   mapAvailable: () => Boolean(mapMetadata && snapshot?.data.map.available),
   reload: loadCatalog, notify: toast,
   saved: (result) => { applyCatalog(result.catalog); toast(result.message); },
-  pick: (draft) => { if (!canEdit()) return; mapPickingDraft = draft; view("overview"); render(); },
+  pick: (draft) => { if (!canEdit()) return; navigationUI.picking = false; navigationUI.preview = null; mapPickingDraft = draft; view("overview"); render(); },
 });
 $("refreshDataButton").addEventListener("click", async () => { await loadCatalog(); await loadMap(); });
 $("openConfiguration").addEventListener("click", () => view("waypoints"));
@@ -477,7 +494,7 @@ function zoomMap(factor) {
 }
 $("mapZoomIn").addEventListener("click", () => zoomMap(0.8));
 $("mapZoomOut").addEventListener("click", () => zoomMap(1.25));
-$("mapFit").addEventListener("click", () => { if (mapMetadata) mapView = [0, 0, mapMetadata.width, mapMetadata.height]; render(); });
+$("mapFit").addEventListener("click", () => { navigationUI.follow = false; if (mapMetadata) mapView = [0, 0, mapMetadata.width, mapMetadata.height]; render(); });
 setInterval(renew, 5000);
 setInterval(render, 500);
 initialize().catch((error) => toast(`连接失败：${error.message}，请刷新后重试`, true));

@@ -78,7 +78,7 @@ def main():
         observer.locator('[data-view="missions"]').click()
         expect(observer.locator(".catalog-card")).to_have_count(1)
         observer.locator('[data-view="integration"]').click()
-        expect(observer.locator(".integration-grid button:disabled")).to_have_count(3)
+        expect(observer.locator(".integration-grid button:disabled")).to_have_count(1)
 
         mobile = browser.new_context(viewport={"width": 390, "height": 844}, is_mobile=True,
                                      device_scale_factor=1, has_touch=True, color_scheme="dark", reduced_motion="reduce", timezone_id="America/Los_Angeles")

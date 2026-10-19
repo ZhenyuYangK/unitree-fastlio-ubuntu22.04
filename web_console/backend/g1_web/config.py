@@ -10,7 +10,7 @@ class Settings:
     port: int = 8080
     token: str = field(default="", repr=False)
     cookie_secure: bool = False
-    lease_seconds: float = 15.0
+    lease_seconds: float = 300.0
     mock_travel_seconds: float = 2.0
     mock_speech_seconds: float = 0.8
     workspace: str = field(default_factory=lambda: str(Path(__file__).resolve().parents[3] / "g1_slam_ws"))

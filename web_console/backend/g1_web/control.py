@@ -12,7 +12,7 @@ class GatewayError(Exception):
 class ControlLease:
     """One controller, many viewers. Call from the gateway event loop only."""
 
-    def __init__(self, seconds=15.0, clock=time.monotonic):
+    def __init__(self, seconds=300.0, clock=time.monotonic):
         self.seconds, self.clock = seconds, clock
         self.secret, self.owner, self.expires = "", "", 0.0
 

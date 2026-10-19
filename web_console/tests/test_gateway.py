@@ -65,6 +65,7 @@ class GatewayFlowTests(unittest.TestCase):
 
     def test_only_one_controller_and_no_lease_secret_broadcast(self):
         lease = self.acquire()
+        self.assertEqual(lease["expires_in"], 300.0)
         self.assertEqual(self.client.post("/api/v1/control/acquire", json={"owner": "another browser"}).status_code, 409)
         self.assertNotIn(lease["lease_id"], self.client.get("/api/v1/state").text)
         self.assertEqual(self.client.post("/api/v1/control/renew", headers=self.headers).status_code, 200)
@@ -121,7 +122,9 @@ class GatewayFlowTests(unittest.TestCase):
         clock = [100.0]
         self.app.state.lease.clock = lambda: clock[0]
         self.start()
-        clock[0] += 16.0
+        clock[0] += 299.0
+        self.assertTrue(self.state()["control"]["held"])
+        clock[0] += 1.1
         self.assertTrue(self.state()["mission"]["active"])
         self.assertFalse(self.state()["control"]["held"])
         self.assertEqual(self.post("cancel", run_id=self.state()["mission"]["run_id"]).status_code, 409)

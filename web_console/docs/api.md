@@ -57,7 +57,7 @@ GET /catalog 返回 source=workspace、revision、files、导航点及任务的�
 
 保存先在临时文件调用现有 WaypointStore/load_missions 校验，备份两个原文件，再原子替换被编辑的单个 YAML。修改任务和导航点共享一个配置版本；任务锁、CLI 写入锁或 recovery_required 标记存在时拒绝保存。POST 重试使用相同 ID 会冲突，不自动重发。地图像素不提供编辑接口。
 
-控制权凭证通过 `X-Control-Lease` 请求头传递，不出现在快照中。首版租约 15 秒，建议 5 秒续租。
+控制权凭证通过 `X-Control-Lease` 请求头传递，不出现在快照中。租约有效期为 300 秒（5 分钟），页面每 5 秒续租；每次续租成功后重新计时 5 分钟。
 
 ## 命令示例
 

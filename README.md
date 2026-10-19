@@ -98,6 +98,10 @@ Nav2 和导航真机/Dry Run 桥的线速度加速上限均为 0.20 m/s²、减�
 角速度加减速幅值均为 4.0 rad/s²。
 参数修改后需重启 Nav2 和导航桥加载；`g1_navigation.sh` 会重新生成运行时参数文件。
 
+导航速度反馈来自 FAST-LIO 的估计速度和去偏置 IMU 转速；原始 `/Odometry` 使用 `body` 坐标系，
+Nav2 启动时自动通过 `navigation_odometry` 转换为 `/Odometry_nav`，处理倒装雷达到 `nav_base` 的方向差异。
+1.0 m/s 是速度上限，实际速度取决于反馈、路径和障碍物。更新此反馈链路后需重新启动 FAST-LIO 和 Nav2。
+
 连接真机速度桥：
 
 ```bash

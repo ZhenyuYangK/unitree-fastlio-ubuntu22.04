@@ -38,6 +38,8 @@ def main():
         expect(observer.locator("#connection")).to_have_text("实时连接")
         expect(observer.locator("#controlButton")).to_be_disabled()
 
+        operator.bring_to_front()
+        expect(operator.locator("#controlValue")).to_have_text("本设备控制")
         operator.locator("#startButton").click()
         expect(operator.locator("#missionValue")).to_have_text("等待放行", timeout=12000)
         run_id = operator.locator("#runId").get_attribute("title")
@@ -47,6 +49,7 @@ def main():
         expect(observer.locator("#runId")).to_have_attribute("title", run_id)
         expect(operator.locator('#stopList [data-point-id="point_01"]')).to_have_class("stop-row is-current")
         expect(operator.locator("#signStopName")).to_have_text("接待区")
+        expect(operator.locator("#continueButton")).to_be_enabled()
         operator.locator("#continueButton").click()
         expect(operator.locator("#stepDetail")).to_have_text("point_02")
         expect(operator.locator("#missionValue")).to_have_text("等待放行", timeout=12000)
@@ -65,7 +68,7 @@ def main():
         expect(operator.locator("html")).to_have_attribute("data-theme", "dark")
         expect(operator.locator("#connection")).to_have_text("实时连接")
         assert operator.locator("#signBanner").evaluate("el => { el.classList.add('emergency-active'); const color = getComputedStyle(el).borderBottomColor; el.classList.remove('emergency-active'); return color; }") == "rgb(255, 107, 94)"
-        expect(operator.locator("#emergencyButton")).to_be_disabled()
+        expect(operator.locator("#emergencyButton")).to_have_count(0)
         assert operator.locator("#cancelButton").evaluate("el => getComputedStyle(el).backgroundColor") == "rgb(18, 38, 75)"
         operator.locator("#cancelButton").click()
         expect(operator.locator("#missionValue")).to_have_text("已取消")

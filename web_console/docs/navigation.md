@@ -44,7 +44,7 @@ G1_WEB_MODE=ros_control bash web_console/run.sh
 
 诊断保存在 `runtime/navigation/diagnostics/relocalization/`：`inputs_*.json` 含地图/配置哈希、配置原文及入口覆盖参数，`global_*.pcd/.json` 含每轮搜索输入和候选，`verification_*.jsonl` 含同批新扫描的候选比较过程。仅启动重定位节点时，可通过 `diagnostics_directory` 指定已有目录；空值不保存诊断文件。
 
-导航期间任务执行器自行按阶段管理运动门。网页没有任意阶段“暂停/恢复”，也不会发送裸速度指令。现有紧急停止按钮继续明确标为未接入，普通任务取消不会被显示为实体急停。
+导航期间任务执行器自行按阶段管理运动门。网页没有任意阶段“暂停/恢复”，也不会发送裸速度指令。未接入的紧急停止占位按钮已移除，普通任务取消保留原有语义。
 
 ## 断线、恢复与互斥
 

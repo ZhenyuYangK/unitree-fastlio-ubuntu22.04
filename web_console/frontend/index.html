@@ -33,7 +33,7 @@
       <div><div class="eyebrow">G1 <span>/</span> 工作空间</div><h1 id="pageTitle">运行总览</h1></div>
       <div class="top-actions"><span id="connection" class="connection">连接中</span><button id="themeButton" class="button theme-button" aria-pressed="false">切换到深色</button><button id="controlButton" class="button secondary" disabled>取得控制权</button></div>
     </header>
-    <div class="mode-notice" id="modeBanner"><span class="mode-tag">连接中</span><span id="modeText">正在同步后端地图与配置…</span><time id="deviceTime">—</time></div>
+    <div class="mode-notice" id="modeBanner"><span class="mode-tag">连接中</span><span id="modeText">正在同步后端地图与配置…</span><span id="controlTime" class="control-time">操作剩余时间：待同步</span></div>
     <div class="data-toolbar"><span id="dataSyncStatus">正在读取配置…</span><button id="refreshDataButton" class="button secondary compact">重新同步</button></div>
     <section class="sign-banner" id="signBanner" aria-label="巡航导视">
       <div id="bannerStopMarker" class="banner-marker" aria-hidden="true"><span class="stop-marker stop-marker-large"><span>01</span></span></div>
@@ -85,7 +85,6 @@
           <a id="taskReport" class="button secondary compact task-report" hidden>下载任务报告</a>
           <p class="control-note" id="controlNote">操作请求被接受后，以后台反馈为准。</p>
           <div class="single-navigation"><h3>单点导航</h3><label class="field-label" for="targetWaypoint">目标导航点</label><select id="targetWaypoint" disabled><option value="">请选择导航点</option></select><p id="targetDetail" class="control-note">选择后在地图预览位置和朝向。</p><button id="goToButton" class="button secondary" disabled>前往该点 →</button><p id="navigationBlocker" class="control-note" role="status">等待导航状态</p><p id="stopConfirmation" class="control-note" role="status"></p></div>
-          <div class="emergency-area"><button id="emergencyButton" class="button emergency" disabled aria-describedby="emergencyNote"><span aria-hidden="true">■</span> 紧急停止</button><p id="emergencyNote">紧急停止接口待接入</p></div>
         </article>
       </div>
       <div class="secondary-grid">

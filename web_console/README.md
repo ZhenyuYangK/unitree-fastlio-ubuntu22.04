@@ -112,6 +112,12 @@ web_console/.venv/bin/python -m pip install playwright
 web_console/.venv/bin/python web_console/tests/browser_smoke.py
 ```
 
+手机端操作权恢复检查会自行启动隔离的 mock 网关，覆盖临时续约失败、断网恢复、前后台切换、到期与多设备接管，不连接机器人：
+
+```bash
+PYTHONPATH=web_console/backend web_console/.venv/bin/python web_console/tests/browser_control_smoke.py
+```
+
 配置编辑浏览器测试使用现场数据的临时副本，测试脚本拒绝对真实工作空间写入：
 
 ```bash

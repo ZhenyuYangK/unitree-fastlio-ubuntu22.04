@@ -13,6 +13,7 @@ Object.assign(phases, { CHECKING: "就绪检查", ARRIVED: "已到站", DWELLING
 let snapshot = null, catalog = null, socket = null, lastReceived = 0, connected = false;
 let pending = false, leaseId = sessionStorage.getItem("g1_control_lease") || "";
 let haveLease = false, retryTimer = null, retryDelay = 1000, instanceId = null, sequence = -1;
+let leaseVersion = 0, leaseValidUntil = 0, renewal = null, snapshotReceivedAt = 0;
 let toastTimer = null, editor = null, mappingUI = null, navigationUI = null, mapMetadata = null, mapView = null, mapPickingDraft = null;
 let catalogLoading = false, mapLoading = false;
 let catalogRetryAt = 0, mapRetryAt = 0;
@@ -43,6 +44,7 @@ function toast(message, error = false) {
 
 async function api(path, { method = "GET", body, control = false, revision } = {}) {
   const headers = {};
+  const requestLease = leaseId, requestVersion = leaseVersion;
   if (body !== undefined) headers["Content-Type"] = "application/json";
   if (control) headers["X-Control-Lease"] = leaseId;
   if (revision) headers["If-Match"] = `"${revision}"`;
@@ -53,7 +55,7 @@ async function api(path, { method = "GET", body, control = false, revision } = {
   const result = await response.json();
   if (!response.ok) {
     if (response.status === 401) showLogin();
-    if (result.error?.code === "CONTROL_REQUIRED") clearLease();
+    if (result.error?.code === "CONTROL_REQUIRED" && control && requestLease === leaseId && requestVersion === leaseVersion) clearLease();
     throw new Error(result.error?.message || result.detail?.[0]?.msg || `接口返回 ${response.status}`);
   }
   return result;
@@ -71,13 +73,30 @@ function view(name) {
 document.querySelectorAll("[data-view]").forEach((el) => el.addEventListener("click", () => view(el.dataset.view)));
 
 function clearLease() {
+  leaseVersion += 1;
   leaseId = "";
   haveLease = false;
+  leaseValidUntil = 0;
   sessionStorage.removeItem("g1_control_lease");
+}
+
+function hasControl() {
+  return Boolean(leaseId && haveLease && Date.now() < leaseValidUntil);
+}
+
+function controlTimeText(fresh) {
+  const control = snapshot?.data.control;
+  if (!fresh) return "操作剩余时间：待同步";
+  if (!control?.held) return "操作剩余时间：未取得操作权";
+  if (leaseId && !hasControl()) return "操作剩余时间：核验中";
+  const elapsed = Math.max(0, Date.now() - snapshotReceivedAt) / 1000;
+  const remaining = Math.max(0, Math.ceil(control.remaining_sec - elapsed));
+  return `操作剩余时间：${String(Math.floor(remaining / 60)).padStart(2, "0")}:${String(remaining % 60).padStart(2, "0")}`;
 }
 
 function showLogin() {
   connected = false;
+  haveLease = false;
   clearTimeout(retryTimer);
   if (socket) socket.close();
   if (!$("loginDialog").open) $("loginDialog").showModal();
@@ -137,7 +156,7 @@ async function loadMap() {
 
 function canEdit() {
   const data = snapshot?.data;
-  return Boolean(connected && performance.now() - lastReceived < 2000 && haveLease && data?.control.held
+  return Boolean(connected && performance.now() - lastReceived < 2000 && hasControl() && data?.control.held
     && data.configuration?.available && catalog?.source === "workspace" && catalog.revision === data.configuration.revision
     && !data.configuration.write_blocker && !data.mission.active
     && data.capabilities.waypoint_write && !pending);
@@ -190,8 +209,16 @@ function renderCatalog() {
 
 function connect() {
   clearTimeout(retryTimer);
+  const previous = socket;
   const current = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws/state`);
   socket = current;
+  connected = false;
+  if (previous) previous.close();
+  current.addEventListener("open", () => {
+    if (socket !== current || !leaseId) return;
+    haveLease = false;
+    renew();
+  });
   current.addEventListener("message", (event) => {
     if (socket !== current) return;
     let message;
@@ -203,7 +230,7 @@ function connect() {
     }
     if (message.sequence <= sequence) return;
     sequence = message.sequence;
-    snapshot = message; connected = true; lastReceived = performance.now(); retryDelay = 1000;
+    snapshot = message; connected = true; lastReceived = performance.now(); snapshotReceivedAt = Date.now(); retryDelay = 1000;
     if (message.data.configuration?.available && message.data.configuration.revision !== catalog?.revision && performance.now() >= catalogRetryAt) loadCatalog();
     if (!message.data.simulated && message.data.map.available && message.data.map.revision !== mapMetadata?.revision && performance.now() >= mapRetryAt) loadMap();
     render();
@@ -354,10 +381,11 @@ function render() {
   const fresh = connected && performance.now() - lastReceived < 2000;
   $("connection").textContent = fresh ? "实时连接" : "连接中 / 状态过期";
   $("connection").className = `connection ${fresh ? "connected" : "offline"}`;
-  $("deviceTime").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  $("controlTime").textContent = controlTimeText(fresh);
   if (!snapshot) return;
   const data = snapshot.data, mission = data.mission, control = data.control;
-  const canControl = fresh && haveLease && control.held && data.capabilities.mission_control && !pending;
+  const ownControl = hasControl();
+  const canControl = fresh && ownControl && control.held && data.capabilities.mission_control && !pending;
   const local = data.mode === "local";
   const canAcquire = fresh && (data.capabilities.mission_control || data.capabilities.waypoint_write || data.capabilities.mission_write || data.capabilities.mapping_control) && !pending;
   $("modeText").textContent = data.simulated ? "模拟演示 · 未连接真实机器人，地图与反馈均为示例" : local ? "本地数据 · 地图、导航点和任务与后端文件同步，机器人实时状态未连接" : data.mode === 'ros_control' ? 'ROS 控制 · 定位导航、单点导航与巡航任务' : "ROS 只读 · 实时位姿、规划路径、建图和配置编辑";
@@ -370,11 +398,11 @@ function render() {
   $("missionDetail").textContent = mission.mission_name || "当前无运行任务";
   $("stepValue").replaceChildren(document.createTextNode(String(mission.current_step)), Object.assign(document.createElement("em"), { textContent: ` / ${mission.total_steps}` }));
   $("stepDetail").textContent = mission.current_waypoint || "等待任务开始";
-  $("controlValue").textContent = !fresh ? "状态过期" : haveLease && control.held ? "本设备控制" : control.held ? control.owner : "暂无控制设备";
-  $("controlDetail").textContent = control.held ? `租约剩余 ${control.remaining_sec.toFixed(0)} 秒` : "查看状态无需取得控制权";
+  $("controlValue").textContent = !fresh ? "状态过期" : leaseId && !ownControl ? "正在核验操作权" : ownControl && control.held ? "本设备控制" : control.held ? control.owner : "暂无控制设备";
+  $("controlDetail").textContent = controlTimeText(fresh);
   $("controlMetricLabel").textContent = data.simulated ? "控制设备" : "操作设备";
-  $("controlButton").textContent = data.simulated ? haveLease ? "释放控制权" : "取得控制权" : haveLease ? "释放操作权" : "取得操作权";
-  $("controlButton").disabled = !canAcquire || (control.held && !haveLease);
+  $("controlButton").textContent = leaseId && !ownControl ? "重新核验操作权" : data.simulated ? ownControl ? "释放控制权" : "取得控制权" : ownControl ? "释放操作权" : "取得操作权";
+  $("controlButton").disabled = !canAcquire || (control.held && !leaseId);
   $("missionSelect").disabled = mission.active || !catalog?.missions.length;
   const selected = catalog?.missions.find((item) => item.id === $("missionSelect").value);
   $("routeSummary").textContent = selected ? `${selected.waypoints.length} 个导航点` : "无可用任务";
@@ -413,9 +441,9 @@ function render() {
     || (catalog?.revision === config?.revision ? `后端配置已同步 · ${catalog?.waypoints.length || 0} 个导航点` : "正在同步后端配置…");
   $("dataSyncStatus").title = catalog?.files ? Object.values(catalog.files).join("\n") : "";
   editor?.refreshControls(canEdit());
-  navigationUI?.render(data, fresh && haveLease && control.held && !pending, fresh);
+  navigationUI?.render(data, fresh && ownControl && control.held && !pending, fresh);
   renderMap(data, mission, route);
-  mappingUI?.render(data, fresh && haveLease && control.held && !pending, fresh);
+  mappingUI?.render(data, fresh && ownControl && control.held && !pending, fresh);
   const logKey = JSON.stringify(data.logs);
   if ($("logList").dataset.key !== logKey) {
     $("logList").dataset.key = logKey; $("logList").replaceChildren();
@@ -436,10 +464,14 @@ async function withPending(action) {
 }
 
 $("controlButton").addEventListener("click", () => withPending(async () => {
-  if (haveLease) { await api("/control/release", { method: "POST", control: true }); clearLease(); }
+  if (leaseId && !hasControl()) { await renew(); return; }
+  if (leaseId) { await api("/control/release", { method: "POST", control: true }); clearLease(); }
   else {
+    const started = Date.now();
     const result = await api("/control/acquire", { method: "POST", body: { owner: deviceName } });
-    leaseId = result.lease_id; haveLease = true; sessionStorage.setItem("g1_control_lease", leaseId);
+    leaseVersion += 1;
+    leaseId = result.lease_id; haveLease = true; leaseValidUntil = started + result.expires_in * 1000;
+    sessionStorage.setItem("g1_control_lease", leaseId);
   }
 }));
 
@@ -454,10 +486,41 @@ $("missionSelect").addEventListener("change", render);
 
 async function renew() {
   if (!leaseId || $("loginDialog").open) return;
-  try { await api("/control/renew", { method: "POST", control: true }); haveLease = true; }
-  catch (error) { clearLease(); toast(error.message, true); }
+  const secret = leaseId, version = leaseVersion;
+  if (renewal?.secret === secret && renewal.version === version) return renewal.promise;
+  const attempt = { secret, version };
+  renewal = attempt;
+  attempt.promise = (async () => {
+    const started = Date.now();
+    try {
+      const result = await api("/control/renew", { method: "POST", control: true });
+      if (leaseId !== secret || leaseVersion !== version) return;
+      leaseValidUntil = started + result.remaining_sec * 1000;
+      haveLease = !$("loginDialog").open;
+    } catch (error) {
+      if (leaseId !== secret || leaseVersion !== version) return;
+      if (haveLease) toast("操作权暂未核验，连接恢复后自动重试", true);
+      haveLease = false;
+    } finally {
+      if (renewal === attempt) renewal = null;
+      render();
+    }
+  })();
+  return attempt.promise;
+}
+
+function resumeControl() {
+  if (document.hidden || $("loginDialog").open) return;
+  if (leaseId) { haveLease = false; renew(); }
+  if (!connected || performance.now() - lastReceived >= 2000) connect();
   render();
 }
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { haveLease = false; render(); }
+  else resumeControl();
+});
+window.addEventListener("online", resumeControl);
+window.addEventListener("pageshow", resumeControl);
 
 async function initialize() {
   const session = await api("/session");

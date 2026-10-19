@@ -48,7 +48,7 @@ def main():
 
     controller = node_params(data, "controller_server")
     controller["use_sim_time"] = False
-    controller["odom_topic"] = "/Odometry"
+    controller["odom_topic"] = "/Odometry_nav"
     controller["controller_frequency"] = 10.0
     controller["min_x_velocity_threshold"] = 0.001
     controller["min_y_velocity_threshold"] = 0.001
@@ -120,7 +120,7 @@ def main():
     bt["use_sim_time"] = False
     bt["global_frame"] = "map"
     bt["robot_base_frame"] = "nav_base"
-    bt["odom_topic"] = "/Odometry"
+    bt["odom_topic"] = "/Odometry_nav"
     # The launch file resolves the G1 tree from the installed package share.
     bt.pop("default_bt_xml_filename", None)
     bt["default_nav_to_pose_bt_xml"] = ""

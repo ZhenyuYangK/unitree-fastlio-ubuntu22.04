@@ -338,7 +338,8 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.assert_correct_localization()  # Distinct new scans can reconfirm.
 
     def test_duplicate_rooms_fail_closed_and_manual_pose_can_resolve(self):
-        self.launch(duplicate=True, verification_timeout_sec=0.7, global_max_attempts=2)
+        self.launch(duplicate=True, verification_timeout_sec=0.7, global_max_attempts=2,
+                    global_direct_accept_coverage=1.0)
         self.wait_for(lambda: self.statuses[-1]["state"] in ("AMBIGUOUS", "FAILED"),
                       sensor=True)
         self.assertEqual(self.statuses[-1]["state"], "AMBIGUOUS", self.log_text())
@@ -351,7 +352,7 @@ class RelocalizationNodeTest(unittest.TestCase):
 
     def test_ambiguous_candidates_retry_and_new_geometry_selects_correct_location(self):
         self.launch(duplicate=True, unique_feature=True, verification_timeout_sec=0.8,
-                    global_max_attempts=3)
+                    global_max_attempts=3, global_direct_accept_coverage=1.0)
         # Initial scans omit the distinctive walls: both locations are plausible.
         self.wait_for(lambda: any(s.get('attempt', 0) >= 2 for s in self.statuses), sensor=True)
         self.assert_no_localization()
@@ -369,7 +370,8 @@ class RelocalizationNodeTest(unittest.TestCase):
         self.assert_no_localization()
 
     def test_candidate_bank_does_not_count_repeated_timestamp(self):
-        self.launch(duplicate=True, unique_feature=True, global_initialization_timeout_sec=2.0)
+        self.launch(duplicate=True, unique_feature=True, global_initialization_timeout_sec=2.0,
+                    global_direct_accept_coverage=1.0)
         self.wait_for(lambda: self.statuses[-1]['state'] == 'VERIFYING_CANDIDATES', sensor=True)
         self.pump(.5, sensor=True, repeat=True)
         self.assert_no_localization()
@@ -378,12 +380,27 @@ class RelocalizationNodeTest(unittest.TestCase):
 
     def test_truncated_candidate_bank_cannot_claim_uniqueness(self):
         self.launch(duplicate=True, global_verification_candidates=1,
-                    verification_timeout_sec=0.7, global_max_attempts=1)
+                    verification_timeout_sec=0.7, global_max_attempts=1,
+                    global_direct_accept_coverage=1.0)
         self.wait_for(lambda: self.statuses[-1]['state'] == 'AMBIGUOUS', sensor=True)
         self.assert_no_localization()
 
+    def test_high_coverage_primary_is_accepted_despite_truncated_candidate_bank(self):
+        self.launch(duplicate=True, global_verification_candidates=1)
+        self.wait_for(lambda: self.poses and self.transforms and self.statuses[-1]['valid'],
+                      sensor=True)
+        self.assertIn('Primary candidate directly accepted', self.log_text())
+        files = list(Path(self.directory.name).glob('verification_*.jsonl'))
+        self.assertTrue(files)
+        rows = [json.loads(line) for line in files[-1].read_text().splitlines()]
+        self.assertGreaterEqual(len(rows), 3)
+        self.assertTrue(rows[-1]['omitted_candidates'])
+        self.assertTrue(rows[-1]['candidates'][0]['stable'])
+        coverage = sum(row['candidates'][0]['coverage'] for row in rows[-3:]) / 3
+        self.assertGreater(coverage, .91)
+
     def test_manual_pose_interrupts_automatic_candidate_comparison(self):
-        self.launch(duplicate=True)
+        self.launch(duplicate=True, global_direct_accept_coverage=1.0)
         self.wait_for(lambda: self.statuses[-1]['state'] == 'VERIFYING_CANDIDATES', sensor=True)
         self.assert_no_localization()
         self.initial_pose()

@@ -38,7 +38,10 @@ g1_relocalization:
     verification_timeout_sec: 20.0
     # 歧义候选排序后，用同一批新扫描比较；仍无法区分时重新采集。
     global_verification_candidates: 3
-    # 两地均匹配时，要求综合评分与覆盖率都拉开差距，抑制局部优化偏差。
+    # 主候选连续确认通过且窗口平均覆盖率严格大于 91% 时直接采用，
+    # 不再要求竞争分差，也不受未纳入验证的额外候选限制；设为 1.0 可禁用。
+    global_direct_accept_coverage: 0.91
+    # 未触发直接采用时，仍要求综合评分与覆盖率都拉开差距。
     global_confirmation_coverage_gap: 0.08
     global_max_attempts: 3
     # 覆盖采集、搜索、候选验证和所有重试；启动脚本统一覆盖此总预算。

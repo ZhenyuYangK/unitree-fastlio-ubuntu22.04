@@ -193,6 +193,7 @@ private:
     max_attempts_ = integer("global_max_attempts", 3);
     max_hypotheses_ = integer("global_verification_candidates", 3);
     confirmation_coverage_gap_ = number("global_confirmation_coverage_gap", .08);
+    direct_accept_coverage_ = number("global_direct_accept_coverage", .91);
     diagnostics_directory_ = str("diagnostics_directory", "");
     confirmation_translation_ = number("confirmation_max_translation", .30);
     confirmation_rotation_ = number("confirmation_max_rotation_deg", 10.) * kPi / 180.;
@@ -229,13 +230,14 @@ private:
     if (mode_ != "manual" && mode_ != "global") {throw std::invalid_argument("initialization_mode must be manual or global");}
     for (double v : {tracking_fitness_, max_scan_age_, valid_timeout_, odom_gap_, collect_seconds_,
         collect_timeout_, verification_timeout_, initialization_timeout_,
-        confirmation_translation_, confirmation_rotation_, confirmation_coverage_gap_})
+        confirmation_translation_, confirmation_rotation_, confirmation_coverage_gap_, direct_accept_coverage_})
     {
       if (!std::isfinite(v) || v <= 0) {throw std::invalid_argument("Relocalization time/quality limits must be finite and positive");}
     }
     if (period_ms_ <= 0 || collection_frames_ < 2 || confirmation_frames_ < 2 ||
       max_collection_points_ < 100 || max_attempts_ < 1 || max_hypotheses_ < 1 ||
-      max_hypotheses_ > 16 || confirmation_coverage_gap_ > 1. || !std::isfinite(body_roll_deg_))
+      max_hypotheses_ > 16 || confirmation_coverage_gap_ > 1. || direct_accept_coverage_ > 1. ||
+      !std::isfinite(body_roll_deg_))
     {throw std::invalid_argument("Invalid collection/confirmation counts or body roll");}
     if (max_scan_age_ > valid_timeout_ || valid_timeout_ > 3.) {
       throw std::invalid_argument("Require max_scan_age_sec <= localization_valid_timeout_sec <= 3 seconds");
@@ -615,9 +617,16 @@ private:
           if (!duplicate) {distinct.push_back(i); comparison.push_back(evidence[i]);}
         }
         const int selected = g1_relocalization::verifiedWinner(
-          comparison, options_.ambiguity_score_gap, omitted_candidates, confirmation_coverage_gap_);
+          comparison, options_.ambiguity_score_gap, omitted_candidates,
+          confirmation_coverage_gap_, direct_accept_coverage_);
         const int winner = selected < 0 ? -1 : distinct[selected];
         if (winner >= 0) {
+          if (winner == 0 && evidence.front().stable() &&
+            evidence.front().coverage() > direct_accept_coverage_)
+          {
+            RCLCPP_INFO(get_logger(), "Primary candidate directly accepted: mean coverage=%.6f > %.6f on %zu fresh scans",
+              evidence.front().coverage(), direct_accept_coverage_, evidence.front().count());
+          }
           RCLCPP_INFO(get_logger(), "Verified candidate %d selected after ranked fresh-scan comparison: %s", winner + 1, progress.str().c_str());
           map_T_odom = hypotheses[winner].transform; anchor = map_T_odom;
           seeded = confirmed = automatic_done = true;
@@ -801,6 +810,7 @@ private:
   int max_attempts_ = 3, max_hypotheses_ = 3, initialization_attempt_ = 0;
   double initialization_timeout_ = 180.;
   double confirmation_coverage_gap_ = .08;
+  double direct_accept_coverage_ = .91;
   double body_roll_deg_ = 180., tracking_fitness_ = 2., max_scan_age_ = 2., valid_timeout_ = 3., odom_gap_ = .1;
   double collect_seconds_ = 2., collect_timeout_ = 15., verification_timeout_ = 20.;
   double confirmation_translation_ = .3, confirmation_rotation_ = .1745;

@@ -61,14 +61,17 @@ private:
   std::deque<Sample> samples_;
 };
 
-// A truncated bank cannot establish uniqueness. A competitor that is still
-// collecting evidence blocks acceptance; a consistently rejected one does not.
+// A stable primary candidate above direct_coverage is accepted without a
+// uniqueness comparison. Otherwise, retain the score/coverage gap rules.
 inline int verifiedWinner(
   const std::vector<CandidateEvidence> & evidence, double gap, bool omitted_candidates = false,
-  double coverage_gap = .08)
+  double coverage_gap = .08, double direct_coverage = .91)
 {
-  if (omitted_candidates || !std::isfinite(gap) || gap <= 0. ||
-    !std::isfinite(coverage_gap) || coverage_gap <= 0.) {return -1;}
+  if (!std::isfinite(gap) || gap <= 0. || !std::isfinite(coverage_gap) || coverage_gap <= 0. ||
+    !std::isfinite(direct_coverage) || direct_coverage <= 0. || direct_coverage > 1.) {return -1;}
+  if (!evidence.empty() && evidence.front().stable() &&
+    evidence.front().coverage() > direct_coverage) {return 0;}
+  if (omitted_candidates) {return -1;}
   int best = -1;
   for (std::size_t i = 0; i < evidence.size(); ++i) {
     if (evidence[i].stable() && (best < 0 || evidence[i].score() > evidence[best].score())) {
